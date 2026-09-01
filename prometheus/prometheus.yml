@@ -1,0 +1,26 @@
+# Prometheus scrapes the three Go services. It reaches them by COMPOSE SERVICE
+# NAME on their internal metrics port, which is why none of them publishes a
+# host port: nothing outside the network needs to read a raw /metrics page, and
+# three more published ports would be three more chances to collide.
+global:
+  # A five-second scrape, against a demo whose sliders move in real time. The
+  # 15s default would put five seconds of delay between dragging a slider and
+  # seeing the graph move, which on a demo reads as "it did not work".
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: producer
+    static_configs:
+      - targets: ["producer:2112"]
+
+  - job_name: consumer
+    static_configs:
+      - targets: ["consumer:2112"]
+
+  # admin serves /metrics on the SAME port as its UI. It is the only service
+  # here with a published port, and separating the two would have meant a
+  # second listener for one gauge.
+  - job_name: admin
+    static_configs:
+      - targets: ["admin:8080"]

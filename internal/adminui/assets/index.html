@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kafka-lab · control</title>
+<!--
+  ONE FILE. NO CDN, NO BUILD STEP, NO FRAMEWORK.
+  Every limit below is server-rendered from the Go constants in
+  internal/control, so this page cannot ask for a setting the server would
+  refuse. Do not restate a bound here as a literal.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0e1116;
+    --panel: #161b22;
+    --edge: #262d36;
+    --ink: #e6edf3;
+    --dim: #8b949e;
+    --produce: #58a6ff;
+    --consume: #3fb950;
+    --lag: #f0883e;
+    --warn: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--edge);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    align-items: baseline;
+  }
+  h1 { font-size: 16px; margin: 0; letter-spacing: .08em; text-transform: uppercase; }
+  header .sub { color: var(--dim); }
+  nav { margin-left: auto; display: flex; gap: 14px; flex-wrap: wrap; }
+  nav a { color: var(--produce); text-decoration: none; border-bottom: 1px dotted currentColor; }
+  nav a:hover { color: var(--ink); }
+  main { padding: 24px; display: grid; gap: 20px; max-width: 1180px; }
+  .row { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .panel { background: var(--panel); border: 1px solid var(--edge); border-radius: 8px; padding: 18px; }
+  .panel h2 {
+    font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--dim); margin: 0 0 14px;
+  }
+  .figure { display: flex; align-items: baseline; gap: 8px; }
+  .figure .value { font-size: 30px; font-variant-numeric: tabular-nums; }
+  .figure .unit { color: var(--dim); font-size: 12px; }
+  .kind {
+    display: inline-block; font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    padding: 2px 6px; border-radius: 3px; border: 1px solid var(--edge); color: var(--dim);
+  }
+  .stale { opacity: .35; }
+  #produced .value { color: var(--produce); }
+  #consumed .value { color: var(--consume); }
+  #lag .value { color: var(--lag); }
+  label { display: block; margin-bottom: 6px; color: var(--dim); font-size: 12px; }
+  .slider { margin-bottom: 20px; }
+  .slider:last-child { margin-bottom: 0; }
+  .slider .head { display: flex; justify-content: space-between; align-items: baseline; }
+  .slider output { font-variant-numeric: tabular-nums; color: var(--ink); }
+  input[type=range] { width: 100%; accent-color: var(--produce); }
+  #consumer-panel input[type=range] { accent-color: var(--consume); }
+  #tail {
+    height: 320px; overflow-y: auto; margin: 0;
+    font-size: 12px; line-height: 1.7; white-space: pre;
+  }
+  #tail div { border-bottom: 1px solid #1d232b; padding: 2px 0; }
+  #tail .meta { color: var(--dim); }
+  #tail .aged { color: var(--lag); }
+  .notice { color: var(--warn); min-height: 1.5em; }
+  .foot { color: var(--dim); font-size: 12px; }
+  .foot code { color: var(--ink); }
+  dl.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin: 0; }
+  dl.kv dt { color: var(--dim); }
+  dl.kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>kafka-lab</h1>
+  <span class="sub">throttle the consumer · watch lag climb · open it back up · watch it drain</span>
+  <nav>
+    <a href="{{ .Links.Grafana }}" target="_blank" rel="noopener noreferrer">Grafana</a>
+    <a href="{{ .Links.Prometheus }}" target="_blank" rel="noopener noreferrer">Prometheus</a>
+    <a href="{{ .Links.KafkaUI }}" target="_blank" rel="noopener noreferrer">kafka-ui</a>
+  </nav>
+</header>
+
+<main>
+
+  <!--
+    MEASURED AND REQUESTED ARE SEPARATE PANELS ON PURPOSE.
+    A consumer asked for 200/s that spends 20ms per message achieves 50/s. A
+    panel showing the requested figure under a "consumed" caption would render
+    perfectly and teach the reader something false.
+  -->
+  <section class="row">
+    <div class="panel" id="produced">
+      <h2>Produced <span class="kind">measured</span></h2>
+      <div class="figure"><span class="value" data-figure="produced">–</span><span class="unit">msg/sec</span></div>
+    </div>
+    <div class="panel" id="consumed">
+      <h2>Consumed <span class="kind">measured</span></h2>
+      <div class="figure"><span class="value" data-figure="consumed">–</span><span class="unit">msg/sec</span></div>
+    </div>
+    <div class="panel" id="lag">
+      <h2>Consumer group lag <span class="kind">measured</span></h2>
+      <div class="figure"><span class="value" data-figure="lag">–</span><span class="unit">messages</span></div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="panel" id="producer-panel">
+      <h2>Producer <span class="kind">setting</span></h2>
+      <div class="slider">
+        <div class="head">
+          <label for="producer-rate">rate asked for</label>
+          <output id="producer-rate-out">–</output>
+        </div>
+        <input type="range" id="producer-rate" name="producer_rate_per_sec"
+               min="{{ .MinRate }}" max="{{ .MaxRate }}" step="1" value="{{ .MinRate }}">
+      </div>
+    </div>
+
+    <div class="panel" id="consumer-panel">
+      <h2>Consumer <span class="kind">setting</span></h2>
+      <div class="slider">
+        <div class="head">
+          <label for="consumer-rate">rate asked for</label>
+          <output id="consumer-rate-out">–</output>
+        </div>
+        <input type="range" id="consumer-rate" name="consumer_rate_per_sec"
+               min="{{ .MinRate }}" max="{{ .MaxRate }}" step="1" value="{{ .MinRate }}">
+      </div>
+      <div class="slider">
+        <div class="head">
+          <label for="consumer-work">simulated work per message</label>
+          <output id="consumer-work-out">–</output>
+        </div>
+        <input type="range" id="consumer-work" name="consumer_work_ms"
+               min="{{ .MinWork }}" max="{{ .MaxWork }}" step="1" value="{{ .MinWork }}">
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Live tail <span class="kind">observer</span></h2>
+      <dl class="kv">
+        <dt>delivered</dt><dd data-figure="tail-delivered">–</dd>
+        <dt>dropped</dt><dd data-figure="tail-dropped">–</dd>
+        <dt>watchers</dt><dd data-figure="tail-subscribers">–</dd>
+      </dl>
+      <p class="foot" style="margin-bottom:0">
+        Read by group <code>{{ .AdminTailGroup }}</code>, separate from the working consumer's
+        <code>{{ .ConsumerGroup }}</code>, from the
+        latest offset, so watching does not perturb the pipeline being measured.
+        A slow browser DROPS rather than blocking the tail; the count is above.
+      </p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Settings source</h2>
+    <p class="notice" id="notice"></p>
+    <p class="foot" id="source">reading <code>{{ .ControlTopic }}</code>…</p>
+    <p class="foot">
+      Every slider publishes one record to the compacted topic
+      <code>{{ .ControlTopic }}</code>. The producer and the consumer tail that
+      topic and apply what arrives — the admin never calls them directly. That
+      is why the settings survive <code>docker compose restart</code>.
+    </p>
+  </section>
+
+  <section class="panel">
+    <h2>Live messages · topic <code>{{ .EventsTopic }}</code></h2>
+    <div id="tail"></div>
+  </section>
+
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  // The bounds live in the DOM, server-rendered from the Go constants. This
+  // script reads them; it does not restate them.
+  const el = (id) => document.getElementById(id);
+  const fig = (name) => document.querySelector('[data-figure="' + name + '"]');
+
+  const notice = el("notice");
+  const source = el("source");
+
+  const sliders = [
+    { input: el("producer-rate"),  out: el("producer-rate-out"),  key: "producer_rate_per_sec", fmt: (v) => v + " msg/sec" },
+    { input: el("consumer-rate"),  out: el("consumer-rate-out"),  key: "consumer_rate_per_sec", fmt: (v) => v + " msg/sec" },
+    { input: el("consumer-work"),  out: el("consumer-work-out"),  key: "consumer_work_ms",      fmt: (v) => v + " ms" },
+  ];
+
+  function paintSliders(settings, fromTopic) {
+    for (const s of sliders) {
+      if (!s.dragging) {
+        s.input.value = settings[s.key];
+      }
+      s.out.textContent = s.fmt(s.input.value);
+    }
+    source.innerHTML = fromTopic
+      ? "current settings came from the control topic"
+      : "waiting for the first record on the control topic — showing defaults, which nobody chose";
+  }
+
+  function say(message) {
+    notice.textContent = message || "";
+  }
+
+  // A slider PUBLISHES only what it changed. Sending the whole object would let
+  // a second browser tab clobber a setting it had never looked at.
+  async function publish(slider) {
+    const body = {};
+    body[slider.key] = slider.key === "consumer_work_ms"
+      ? parseInt(slider.input.value, 10)
+      : parseFloat(slider.input.value);
+    try {
+      const res = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        say(data.error || ("settings rejected: HTTP " + res.status));
+        return;
+      }
+      say("");
+      // The response is the CLAMPED, PUBLISHED record. Ask for 9999 and the
+      // slider snaps back to what actually happened.
+      slider.dragging = false;
+      paintSliders(data, data.from_control_topic);
+    } catch (err) {
+      say("could not reach the admin API: " + err);
+    }
+  }
+
+  for (const s of sliders) {
+    s.dragging = false;
+    s.input.addEventListener("input", () => {
+      s.dragging = true;
+      s.out.textContent = s.fmt(s.input.value);
+    });
+    s.input.addEventListener("change", () => publish(s));
+  }
+
+  const fmtRate = (v) => (v >= 100 ? v.toFixed(0) : v.toFixed(1));
+
+  function paintStats(stats) {
+    const stale = new Set(stats.degraded || []);
+
+    const set = (name, key, value) => {
+      const node = fig(name);
+      node.textContent = value;
+      node.parentElement.classList.toggle("stale", stale.has(key));
+    };
+
+    set("produced", "produced_per_sec", fmtRate(stats.measured.produced_per_sec));
+    set("consumed", "consumed_per_sec", fmtRate(stats.measured.consumed_per_sec));
+    set("lag", "consumer_group_lag", stats.measured.consumer_group_lag.toLocaleString());
+
+    fig("tail-delivered").textContent = stats.tail.delivered.toLocaleString();
+    fig("tail-dropped").textContent = stats.tail.dropped.toLocaleString();
+    fig("tail-subscribers").textContent = stats.tail.subscribers;
+
+    paintSliders({
+      producer_rate_per_sec: stats.requested.producer_rate_per_sec,
+      consumer_rate_per_sec: stats.requested.consumer_rate_per_sec,
+      consumer_work_ms: stats.requested.consumer_work_ms,
+    }, true);
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch("/api/stats", { cache: "no-store" });
+      if (res.ok) { paintStats(await res.json()); }
+    } catch (err) {
+      // A missed poll is not worth a banner; the next one is a second away.
+    }
+    setTimeout(poll, 1000);
+  }
+
+  const tail = el("tail");
+  const TAIL_MAX = 200;
+
+  function appendTail(frame) {
+    const line = document.createElement("div");
+    const aged = frame.age_ms > 2000;
+    line.innerHTML =
+      '<span class="meta">' + frame.partition + "/" + frame.offset + " " + frame.key + "</span> " +
+      frame.summary +
+      ' <span class="' + (aged ? "aged" : "meta") + '">+' + frame.age_ms + "ms</span>";
+    const atBottom = tail.scrollHeight - tail.scrollTop - tail.clientHeight < 40;
+    tail.appendChild(line);
+    while (tail.childElementCount > TAIL_MAX) { tail.removeChild(tail.firstChild); }
+    if (atBottom) { tail.scrollTop = tail.scrollHeight; }
+  }
+
+  function openTail() {
+    const es = new EventSource("/api/tail");
+    es.onmessage = (ev) => {
+      try { appendTail(JSON.parse(ev.data)); } catch (err) { /* skip a bad frame */ }
+    };
+    // EventSource reconnects on its own; nothing to do but let it.
+  }
+
+  async function boot() {
+    try {
+      const res = await fetch("/api/settings", { cache: "no-store" });
+      const data = await res.json();
+      paintSliders(data, data.from_control_topic);
+    } catch (err) {
+      say("could not read the current settings: " + err);
+    }
+    openTail();
+    poll();
+  }
+
+  boot();
+})();
+</script>
+
+</body>
+</html>

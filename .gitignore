@@ -1,0 +1,7 @@
+cover.out
+
+# Compiled binaries from a bare `go build ./cmd/...`
+/admin
+/consumer
+/producer
+/topic-init

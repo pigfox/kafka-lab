@@ -1,0 +1,257 @@
+# kafka-lab — a self-contained backpressure demo.
+#
+# ── THE PORT BLOCK: 18080–18083 AND 19092 ────────────────────────────────────
+#
+# This block was chosen to avoid colliding with the Docker ports already in use
+# on the machine this was built for — the ledger's Postgres and the rest of the
+# local estate sit on the conventional numbers (5432, 8080, 3000, 9090, 9092),
+# and a demo that takes a port something else already holds is a demo whose
+# first experience is a confusing bind error. Nothing here uses a default port
+# for its service: Grafana is not on 3000, Prometheus is not on 9090, Kafka is
+# not on 9092. That is deliberate, and it is why every one is written out below
+# rather than left implicit.
+#
+# Every port is overridable — `KL_ADMIN_PORT=28080 ./run.sh` — because the block
+# that is free on one laptop is taken on another.
+#
+# ── NO .env FILE, ANYWHERE ───────────────────────────────────────────────────
+#
+# Every tunable below is ${VAR:-default} with a literal default. Compose reads a
+# .env file automatically if one exists, which is exactly why there is not one:
+# a defaulted variable whose value depends on an untracked file is a variable
+# nobody can reason about from the repository. Export a shell variable to
+# override; the defaults are the documented behaviour.
+#
+# ── NO SECRETS ───────────────────────────────────────────────────────────────
+#
+# Kafka speaks PLAINTEXT on the compose network. There is nothing to protect
+# here and no credential anywhere in this file, which is a property worth
+# keeping: the moment a demo needs a password, it acquires a .env file.
+
+name: kafka-lab
+
+services:
+
+  # ── the broker ─────────────────────────────────────────────────────────────
+  #
+  # KRaft mode: this is one process being both broker and controller, with NO
+  # ZOOKEEPER. Zookeeper has been optional since Kafka 3.3 and removed in 4.0,
+  # so a demo that still shipped it would be teaching a retired topology.
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kafka-lab-kafka
+    ports:
+      # Only the EXTERNAL listener is published. The internal one (9092) stays
+      # on the compose network, which is why the services below address
+      # kafka:9092 while the host addresses localhost:19092.
+      - "${KL_KAFKA_PORT:-19092}:19092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      # THREE LISTENERS, and the split is what makes the lab reachable from
+      # both sides. A single listener cannot advertise both `kafka:9092` (right
+      # for a container) and `localhost:19092` (right for the host), because a
+      # broker advertises ONE address per listener and every client is told to
+      # reconnect to it.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # One broker, so every replication factor is one. Leaving these at their
+      # defaults of 3 makes the internal topics undercreatable and the first
+      # consumer group join fails with a message that names none of this.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+
+      # Zero rebalance delay. The default three seconds is a sensible production
+      # cushion and three seconds of a blank lag panel in a demo.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Compaction must run often enough to SHOW compaction. The defaults would
+      # leave the settings record uncompacted for hours, which is correct for a
+      # real cluster and useless for a lab whose point is that the record
+      # survives a restart.
+      KAFKA_LOG_CLEANER_ENABLE: "true"
+      KAFKA_LOG_CLEANER_BACKOFF_MS: 5000
+
+      CLUSTER_ID: kafka-lab-single-node-000
+    healthcheck:
+      # THE BROKER API, not a TCP probe. A port that accepts a connection is not
+      # a broker that will answer a metadata request, and the difference is the
+      # whole reason the services below can rely on service_healthy.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 15s
+
+  # ── one-shot topic creation ────────────────────────────────────────────────
+  #
+  # Runs, creates `events` and `control`, exits 0. Everything downstream waits
+  # on service_completed_successfully, so no service has to guess whether its
+  # topic exists yet — and the topic CONFIGS (compaction on control, retention
+  # on events) are set in exactly one place.
+  topic-init:
+    build:
+      context: .
+      args:
+        CMD: topic-init
+    container_name: kafka-lab-topic-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      KL_EVENT_PARTITIONS: "${KL_EVENT_PARTITIONS:-3}"
+    restart: "no"
+
+  # ── the pipeline ───────────────────────────────────────────────────────────
+
+  producer:
+    build:
+      context: .
+      args:
+        CMD: producer
+    container_name: kafka-lab-producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      KL_METRICS_ADDR: ":2112"
+      KL_EVENT_SEED: "${KL_EVENT_SEED:-1}"
+      KL_EVENT_FILLER_BYTES: "${KL_EVENT_FILLER_BYTES:-0}"
+    restart: unless-stopped
+
+  consumer:
+    build:
+      context: .
+      args:
+        CMD: consumer
+    container_name: kafka-lab-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      KL_METRICS_ADDR: ":2112"
+    restart: unless-stopped
+
+  # ── the control plane ──────────────────────────────────────────────────────
+  #
+  # admin publishes settings to the `control` topic and reads its figures from
+  # Prometheus and from the group coordinator. It holds NO connection to the
+  # producer or the consumer — the demo configuring itself over its own bus is
+  # the point, and a direct HTTP call would make that claim untrue to anyone
+  # reading this file.
+  admin:
+    build:
+      context: .
+      args:
+        CMD: admin
+    container_name: kafka-lab-admin
+    depends_on:
+      kafka:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+    ports:
+      - "${KL_ADMIN_PORT:-18080}:8080"
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      KL_HTTP_ADDR: ":8080"
+      KL_PROMETHEUS_URL: "http://prometheus:9090"
+      KL_RATE_WINDOW: "${KL_RATE_WINDOW:-30s}"
+      KL_TAIL_BUFFER: "${KL_TAIL_BUFFER:-64}"
+      KL_LAG_INTERVAL: "${KL_LAG_INTERVAL:-2s}"
+      # THE LINKS THE PAGE RENDERS ARE HOST-SIDE. The browser is outside this
+      # network, so http://prometheus:9090 would be a dead link. These must
+      # track the published ports above.
+      KL_LINK_GRAFANA: "http://localhost:${KL_GRAFANA_PORT:-18081}"
+      KL_LINK_PROMETHEUS: "http://localhost:${KL_PROMETHEUS_PORT:-18082}"
+      KL_LINK_KAFKA_UI: "http://localhost:${KL_KAFKA_UI_PORT:-18083}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8080/healthz >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── observability ──────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: kafka-lab-prometheus
+    ports:
+      - "${KL_PROMETHEUS_PORT:-18082}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # A short retention: this is a lab, and a demo that grows a data
+      # directory over weeks is a demo that eventually surprises someone.
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    depends_on:
+      - producer
+      - consumer
+      - admin
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: kafka-lab-grafana
+    ports:
+      - "${KL_GRAFANA_PORT:-18081}:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      # ANONYMOUS AUTH, NO LOGIN FORM. A demo that opens on a username field is
+      # a demo that stops at the username field. There is nothing here to
+      # protect: the datasource is a Prometheus on the same private network
+      # holding six series about a synthetic event stream.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+      # Land on the lab dashboard rather than the Grafana welcome page, so
+      # "open Grafana" is one click rather than three.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/kafka-lab.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-lab-kafka-ui
+    ports:
+      - "${KL_KAFKA_UI_PORT:-18083}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: kafka-lab
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+      AUTH_TYPE: "DISABLED"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+# NO NAMED VOLUMES, deliberately. Every service keeps its state in the
+# container's own writable layer, so `./stop.sh` (compose down -v) genuinely
+# resets the lab to nothing. A lab whose "fresh start" carries yesterday's
+# offsets is a lab that cannot be reasoned about from a cold run.

@@ -1,0 +1,17 @@
+# The datasource is PROVISIONED rather than clicked. "Populated on first load"
+# is the requirement, and a datasource a human has to add is a dashboard that
+# opens on a row of red panels.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # The compose-network address: Grafana's BACKEND makes this request, not
+    # the browser, so localhost:18082 would be wrong here even though it is
+    # right in the admin UI's link bar.
+    url: http://prometheus:9090
+    isDefault: true
+    uid: kafka-lab-prometheus
+    jsonData:
+      timeInterval: 5s

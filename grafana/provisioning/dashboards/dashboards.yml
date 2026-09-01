@@ -1,0 +1,16 @@
+# File-based dashboard provisioning. The JSON in ../dashboards is mounted
+# read-only, so the dashboard is part of the repository rather than part of a
+# Grafana volume somebody would have to export by hand to share.
+apiVersion: 1
+
+providers:
+  - name: kafka-lab
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
