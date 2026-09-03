@@ -1,0 +1,43 @@
+== PF-S313 graded run — environment ==
+
+captured: 2026-09-03T23:18:52Z
+
+== compose project ==
+COMPOSE_PROJECT_NAME=kafka-lab   (exported on every command; the ambient value on this machine is 'pf')
+
+== run parameters, identical on both arms except KL_DEDUPE ==
+KL_FAULT_RATE=0.01
+KL_FAULT_SEED=pf-s313
+KL_RUN_NONCE=pf-s313-graded
+KL_EVENT_SEED=1            (compose default)
+KL_EVENT_PARTITIONS=3      (compose default)
+KL_DEDUPE_CAPACITY=50000   (compose default)
+KL_DEDUPE_TTL=10m          (compose default)
+
+== git ==
+HEAD at run time: ce9110cb67ad1d9c6affcf3ac47fb5b85e67b283
+
+== docker ==
+server 26.1.4
+Docker Compose version v2.27.1
+
+== compose images ==
+CONTAINER              REPOSITORY               TAG                 IMAGE ID            SIZE
+kafka-lab-admin        kafka-lab-admin          latest              0a49e7cb663d        25.7MB
+kafka-lab-consumer     kafka-lab-consumer       latest              ec066e93adef        23.3MB
+kafka-lab-grafana      grafana/grafana          11.4.0              c0b69935a246        486MB
+kafka-lab-kafka        apache/kafka             3.9.0               2956061ba5d3        404MB
+kafka-lab-kafka-ui     provectuslabs/kafka-ui   v0.7.2              99307ab28a49        291MB
+kafka-lab-producer     kafka-lab-producer       latest              5318466b42cd        23.3MB
+kafka-lab-prometheus   prom/prometheus          v3.1.0              b03768b531a2        295MB
+kafka-lab-topic-init   kafka-lab-topic-init     latest              d04a905f9885        17.1MB
+
+== image digests (RepoDigests / Id) ==
+kafka-lab-producer                 sha256:5318466b42cd5a97530aca207bb79c89a9c4ce5bbf165a4f8c8b5c148621a2df (locally built, no repo digest)
+kafka-lab-consumer                 sha256:ec066e93adefefe24565081c5461681fbae3cc14e7afe1e4ac2834f444153f8e (locally built, no repo digest)
+kafka-lab-admin                    sha256:0a49e7cb663dfbc8c40d9c98d89d4a79004c2d45be152e0faa97b88656a2e2cd (locally built, no repo digest)
+kafka-lab-topic-init               sha256:d04a905f988562ce5dde1277e9f4ffe8374ea914a5a45753c4010c16cb55cd7e (locally built, no repo digest)
+apache/kafka:3.9.0                 sha256:2956061ba5d3388af8eb3148200f385ccba13ef75bc0eb6dcca5827ebd2d36d4 apache/kafka@sha256:fbc7d7c428e3755cf36518d4976596002477e4c052d1f80b5b9eafd06d0fff2f
+prom/prometheus:v3.1.0             sha256:b03768b531a2b8c6b6813c7bf3ed6b5ad50c62eba9f67ab50b991267f010133d prom/prometheus@sha256:6559acbd5d770b15bb3c954629ce190ac3cbbdb2b7f1c30f0385c4e05104e218
+grafana/grafana:11.4.0             sha256:c0b69935a2469f0add84fa71a1632a2594c78aeeb016ba9f5d8728a4b4c1b976 grafana/grafana@sha256:d8ea37798ccc41061a62ab080f2676dda6bf7815558499f901bdb0f533a456fb
+provectuslabs/kafka-ui:v0.7.2      sha256:99307ab28a49d7bfa4102e3f4961eccb607c7ad9a3aa83c604b14705e6ff0896 provectuslabs/kafka-ui@sha256:8f2ff02d64b0a7a2b71b6b3b3148b85f66d00ec20ad40c30bdcd415d46d31818

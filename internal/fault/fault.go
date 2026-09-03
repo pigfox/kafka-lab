@@ -49,8 +49,9 @@ import (
 
 // Injector decides which records fault, and remembers which already have.
 type Injector struct {
-	rate float64
-	seed string
+	rate    float64
+	seed    string
+	onFault func(runner.Record)
 
 	mu    sync.Mutex
 	fired map[string]struct{}
@@ -61,8 +62,30 @@ type Injector struct {
 // A rate of zero — the default everywhere — fires nothing, so the lab's
 // ordinary behaviour is unchanged until someone asks for a fault. A rate of one
 // or more fires on every distinct key exactly once.
-func New(rate float64, seed string) *Injector {
-	return &Injector{rate: rate, seed: seed, fired: make(map[string]struct{})}
+//
+// onFault is called once for every key that fires, at the moment it fires.
+//
+// ── WHY THE CALLBACK EXISTS, WHICH A MEASURED RUN DISCOVERED THE HARD WAY
+//
+// It is tempting to log the REWIND TARGETS instead and call that the fault
+// record. That is what the first graded run did, and the log it produced was
+// incomplete in a way that looked complete. Targets picks at most ONE record per
+// partition per batch, so when two eligible keys land in the same partition of
+// the same batch, both are marked fired and only the earlier is returned. The
+// later one is spent silently.
+//
+// The consequence is not a small inaccuracy. The FIRED set is a pure function of
+// the seed and the delivered keys, and is therefore identical across two runs of
+// the same records. The TARGET set is a subset of it chosen by batch
+// composition, which the broker decides and which differs between runs. A
+// comparison of two arms' target sets is a comparison of their batching; the
+// first graded run's arms shared only 25 of 34 and 30 keys, and the difference
+// was entirely this.
+func New(rate float64, seed string, onFault func(runner.Record)) *Injector {
+	if onFault == nil {
+		onFault = func(runner.Record) {}
+	}
+	return &Injector{rate: rate, seed: seed, onFault: onFault, fired: make(map[string]struct{})}
 }
 
 // Rate reports the configured fault rate.
@@ -119,11 +142,17 @@ func (i *Injector) Fault(r runner.Record) bool {
 	}
 
 	i.mu.Lock()
-	defer i.mu.Unlock()
 	if _, already := i.fired[r.DedupeKey]; already {
+		i.mu.Unlock()
 		return false
 	}
 	i.fired[r.DedupeKey] = struct{}{}
+	i.mu.Unlock()
+
+	// Reported OUTSIDE the lock: this is the only call here that reaches
+	// arbitrary caller code, and holding the injector's lock across it would
+	// make a logging call able to stall every other partition's decision.
+	i.onFault(r)
 	return true
 }
 
@@ -132,8 +161,15 @@ func (i *Injector) Fault(r runner.Record) bool {
 //
 // Earliest rather than latest, because a rewind to a later offset would leave
 // an earlier faulted record committed — the loop would move past a record whose
-// fault never produced its redelivery, and the injection log would then name
-// faults the metrics cannot account for.
+// fault never produced its redelivery.
+//
+// AT MOST ONE TARGET PER PARTITION, SO THE TARGET SET IS A SUBSET OF THE FIRED
+// SET. Two eligible keys in the same partition of the same batch both fire and
+// both are spent, but only the earlier is rewound to — and rewinding to the
+// earlier one redelivers the later one anyway, so nothing is lost. What this
+// does mean is that the target set depends on BATCH COMPOSITION and the fired
+// set does not. Every fired key is reported through onFault for exactly that
+// reason: the reproducible record of what an injector did is what it FIRED.
 //
 // It returns nil when nothing faulted, which is the signal to commit normally.
 func (i *Injector) Targets(recs []runner.Record) []runner.Record {

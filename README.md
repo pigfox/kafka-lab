@@ -186,6 +186,18 @@ readable in `docker-compose.yml`.
 | `KL_LAG_INTERVAL` | `2s` | How often admin asks the coordinator for lag |
 | `KL_READY_TIMEOUT` | `120` | How long `run.sh` waits for admin, in seconds |
 
+Delivery semantics — all off by default, so the lab behaves exactly as it always
+has until you ask for one. See [the section above](#delivery-semantics-the-duplicate-that-matters).
+
+| Variable | Default | What it does |
+|---|---|---|
+| `KL_DEDUPE` | `false` | Suppress a redelivery whose key the consumer has already applied |
+| `KL_DEDUPE_CAPACITY` | `50000` | Keys the idempotency store holds; beyond this the oldest is forgotten |
+| `KL_DEDUPE_TTL` | `10m` | How long a key is remembered, measured from its first sighting |
+| `KL_FAULT_RATE` | `0` | Fraction of distinct keys whose commit is replaced by a cursor rewind |
+| `KL_FAULT_SEED` | `kafka-lab` | Makes the fault set a pure function of the record keys |
+| `KL_RUN_NONCE` | *(random)* | Pins the producer's identity prefix so two runs emit identical keys. **Experiments only** — two runs sharing a nonce also share identities, so a consumer with dedupe on would discard the second as duplicates of the first |
+
 Kafka speaks PLAINTEXT on the compose network. There are no credentials
 anywhere in this repository, and nothing here reads a path outside its own
 clone.
@@ -231,6 +243,135 @@ internal/config      environment reading, with literal defaults
 ```
 
 ---
+
+## Delivery semantics: the duplicate that matters
+
+Kafka gives you **at-least-once**. A record can be delivered twice, and the
+delivery that hurts is not a stray extra message — it is the one that arrives
+*after its effect was already applied*, because the process died between doing
+the work and recording that it had.
+
+The consume loop is arranged to make that window real rather than theoretical:
+
+1. fetch a batch,
+2. apply every record in it,
+3. commit the offsets.
+
+Stop the process between 2 and 3 and the effects have happened while the offsets
+say they have not. Whoever owns those partitions next reads the same records
+again. Committing *first* would be worse, not better — the offset would move past
+work that never happened, and the messages would be gone instead of repeated.
+At-least-once is the choice, and the duplicate is its price.
+
+The lab can inject that failure on demand and count what it costs.
+
+### Try it
+
+```sh
+# the at-least-once arm: duplicates land and are applied a second time
+KL_FAULT_RATE=0.01 KL_FAULT_SEED=pf-s313 ./run.sh
+
+# the idempotent arm: the same duplicates land and are suppressed
+KL_DEDUPE=true KL_FAULT_RATE=0.01 KL_FAULT_SEED=pf-s313 ./run.sh
+```
+
+Both are off by default. The Grafana dashboard's last panel plots all four
+numbers below.
+
+### The mechanism, and what it does not model
+
+The injector **rewinds the consumer's own cursor**, in process, with franz-go's
+`SetOffsets` — back to the offset of the record that faulted, carrying that
+record's real leader epoch. That reproduces a crash between apply and commit
+without killing anything: the effects ran, the offset never moved, the records
+come back.
+
+The obvious alternative does nothing at all. *Skipping the commit and carrying
+on produces no duplicate*, silently: franz-go keeps the consume cursor in memory
+and advances it on every poll, and reads the committed offset back only when a
+partition is assigned. An uncommitted batch is simply never seen again. A harness
+built that way reports zero duplicates and looks like it works.
+
+What this **does** model: one process, crashing between apply and commit.
+
+What it **does not** model, and these are different failures with different
+answers:
+
+- a **consumer group rebalance** moving a partition to another member,
+- a **restart**, where the in-memory store starts empty,
+- a **second consumer instance**, which has its own store and shares nothing.
+
+### A rewind redelivers a tail — this is a finding, not noise
+
+A cursor is per *partition*. Rewinding to one record replays that record **and
+every later record of that partition the loop had already polled**. So duplicates
+substantially exceed injected faults, and the multiplier is whatever the broker
+happened to put in that batch.
+
+That is not an artefact of the harness. It is what a crash does: the process
+does not lose one message, it loses everything applied since the last commit. Any
+sizing done on "we inject 1% of records, so we expect about 1% duplicates" is
+wrong by more than an order of magnitude, and the measurement below is the
+evidence.
+
+### Measured
+
+Both arms: 3 partitions, fault rate `0.01`, seed `pf-s313`, a pinned run nonce so
+each arm is fed byte-identical record keys, a 50 000-key store with a 10-minute
+window, and `./stop.sh` between them so the second arm does not inherit the
+first's offsets. Raw captures — metric scrapes, full consumer logs, image
+digests — are committed under `results/pf-s313/capture/`.
+
+| | at-least-once (`KL_DEDUPE=false`) | idempotent (`KL_DEDUPE=true`) |
+|---|---|---|
+| records the loop finished | 6773 | 7515 |
+| effects run | 6773 | 5389 |
+| **applied a second time** | **1948** | **0** |
+| duplicates suppressed | 0 | 2126 |
+| keys faulted | 56 | 59 |
+| cursor rewinds | 27 | 36 |
+| redeliveries in the log | 1948 | 2126 |
+| store evictions | 0 | 0 |
+| store expiries | 0 | 0 |
+
+**The at-least-once arm applied 1948 records a second time.** Its 56 faults
+produced those 1948 duplicates — roughly 35 duplicate applications per injected
+fault, which is the tail effect above, not a rate.
+
+**The idempotent arm applied nothing twice.** It saw *more* redeliveries — 2126,
+because it ran slightly longer — and suppressed every one of them.
+
+Every figure is checked against the committed captures by
+`internal/results`, which fails the build if this table and those files ever
+disagree. The two loss counters being zero is what makes the rest readable: a
+store that had been evicting would produce double applies of its own, and the
+number would be measuring the store instead of the delivery semantics.
+
+The fault sets are also identical. Both arms fired on the same keys over the
+records both actually delivered — 54 keys across the 3 partitions — because the
+decision is `sha256(seed ‖ key)` and not a draw from a random stream, so batch
+boundaries and delivery order cannot move it.
+
+### Scope, stated as properties rather than caveats
+
+- **The store is in-process and bounded.** With capacity *C* and window *T*, a
+  redelivery arriving later than *T* after the first sighting is **not caught**,
+  and neither is one whose key was pushed out by more than *C* distinct keys
+  arriving since. Defaults are C = 50 000 and T = 10 minutes, and the window
+  matches the topic's retention on purpose: a record the broker has aged out
+  cannot be redelivered, so remembering it longer buys nothing. Both losses are
+  counted and published as `kafka_lab_dedupe_evictions_total` and
+  `kafka_lab_dedupe_expiries_total`, labelled by store.
+- **The guarantee does not survive a restart or a rebalance.** Nothing is written
+  down. A new process, or a partition moving to another member, starts with an
+  empty store, and every message still in flight is first-seen again.
+- **Kafka transactions and exactly-once semantics are out of scope.** They are
+  not implemented, not measured, and not approximated here. This lab demonstrates
+  at-least-once delivery and an idempotent consumer, which is a different
+  technique with a different cost.
+- **A record with no identity header cannot be deduplicated.** It is applied and
+  counted in `kafka_lab_records_without_dedupe_key_total` rather than dropped or
+  quietly treated as unique. It was zero on both arms above.
 
 ## Notes and limits
 

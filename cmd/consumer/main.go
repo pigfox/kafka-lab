@@ -103,7 +103,10 @@ func run(log *slog.Logger) error {
 	// both arms of an experiment are fed the same faults.
 	faultRate := config.Float("KL_FAULT_RATE", 0)
 	faultSeed := config.String("KL_FAULT_SEED", "kafka-lab")
-	injector := fault.New(faultRate, faultSeed)
+	injector := fault.New(faultRate, faultSeed, func(r runner.Record) {
+		log.Info("fault fired", "key", r.DedupeKey, "partition", r.Partition,
+			"offset", r.Offset, "epoch", r.LeaderEpoch)
+	})
 
 	log.Info("delivery semantics configured",
 		"dedupe", dedupe, "capacity", dedupeCapacity, "ttl", dedupeTTL,

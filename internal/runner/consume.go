@@ -24,6 +24,7 @@ import (
 // delivery, so a redelivery would carry a different key and the idempotency
 // store would report it as first-seen. An empty key is a record that cannot be
 // deduplicated, and saying so is the only honest answer.
+//
 // Topic, Partition, Offset and LeaderEpoch are what a rewind needs: a cursor
 // seek is addressed by topic and partition, and the LEADER EPOCH is carried
 // rather than defaulted to -1 because it is what lets the broker detect that
@@ -179,7 +180,7 @@ func ConsumeLoop(
 		// skip them entirely — the opposite failure to the one being modelled.
 		if targets := faulter.Targets(recs); len(targets) > 0 {
 			for _, t := range targets {
-				log.Info("fault injected: rewinding instead of committing",
+				log.Info("rewinding instead of committing",
 					"key", t.DedupeKey,
 					"partition", t.Partition,
 					"offset", t.Offset,

@@ -1,0 +1,4 @@
+time=2026-09-03T23:42:42.672Z level=INFO msg="waiting for the broker" brokers=[kafka:9092]
+time=2026-09-03T23:42:42.673Z level=INFO msg="metrics listening" addr=:2112
+time=2026-09-03T23:42:42.736Z level=WARN msg="KL_RUN_NONCE is set: record identities are REPRODUCIBLE and will collide with any other run sharing this nonce" nonce=pf-s313-graded
+time=2026-09-03T23:42:42.736Z level=INFO msg="producer run identity" nonce=pf-s313-graded header=kafka-lab-event-id
