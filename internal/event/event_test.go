@@ -1,6 +1,7 @@
 package event
 
 import (
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -189,3 +190,102 @@ func TestJSONWrapsAMarshalFailureAndNamesTheSequence(t *testing.T) {
 }
 
 var errBoom = errors.New("boom")
+
+// ── record identity ────────────────────────────────────────────────────────
+
+func TestDedupeIDJoinsTheNonceAndTheSequence(t *testing.T) {
+	if got := DedupeID("deadbeefdeadbeef", 42); got != "deadbeefdeadbeef:42" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// Seq restarts at 1 every time the producer starts, so two runs must not
+// produce the same identity for their first message.
+func TestDedupeIDSeparatesTwoRunsAtTheSameSequence(t *testing.T) {
+	if DedupeID("aaaaaaaaaaaaaaaa", 1) == DedupeID("bbbbbbbbbbbbbbbb", 1) {
+		t.Fatal("two runs collided at seq 1; the nonce is not reaching the id")
+	}
+}
+
+func TestDedupeIDIsUniquePerSequenceWithinARun(t *testing.T) {
+	seen := map[string]bool{}
+	for seq := uint64(1); seq <= 1000; seq++ {
+		id := DedupeID("00112233445566ff", seq)
+		if seen[id] {
+			t.Fatalf("id %q repeated within one run", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestNewRunNonceIsHexAndSixteenCharacters(t *testing.T) {
+	n, err := NewRunNonce()
+	if err != nil {
+		t.Fatalf("NewRunNonce: %v", err)
+	}
+	if len(n) != 16 {
+		t.Fatalf("nonce %q has %d characters, want 16", n, len(n))
+	}
+	if _, err := hex.DecodeString(n); err != nil {
+		t.Fatalf("nonce %q is not hex: %v", n, err)
+	}
+}
+
+// The nonce must not contain the separator, or the two halves of an id stop
+// being separable.
+func TestNewRunNonceCannotContainTheSeparator(t *testing.T) {
+	for i := 0; i < 64; i++ {
+		n, err := NewRunNonce()
+		if err != nil {
+			t.Fatalf("NewRunNonce: %v", err)
+		}
+		if strings.Contains(n, dedupeSeparator) {
+			t.Fatalf("nonce %q contains the separator %q", n, dedupeSeparator)
+		}
+	}
+}
+
+func TestTwoRunNoncesDiffer(t *testing.T) {
+	a, err := NewRunNonce()
+	if err != nil {
+		t.Fatalf("NewRunNonce: %v", err)
+	}
+	b, err := NewRunNonce()
+	if err != nil {
+		t.Fatalf("NewRunNonce: %v", err)
+	}
+	if a == b {
+		t.Fatalf("two nonces were identical (%q); the run nonce is not random", a)
+	}
+}
+
+func TestNewRunNonceWrapsAReaderFailure(t *testing.T) {
+	original := randRead
+	t.Cleanup(func() { randRead = original })
+	randRead = func([]byte) (int, error) { return 0, errRandFail }
+
+	n, err := NewRunNonce()
+	if err == nil {
+		t.Fatal("a failing entropy source must be an error, not a nonce")
+	}
+	if n != "" {
+		t.Fatalf("got nonce %q alongside the error", n)
+	}
+	if !errors.Is(err, errRandFail) {
+		t.Fatalf("the reader's error was not wrapped: %v", err)
+	}
+	if !strings.Contains(err.Error(), "run nonce") {
+		t.Fatalf("the wrap does not name what failed: %v", err)
+	}
+}
+
+var errRandFail = errors.New("no entropy")
+
+// THE HEADER NAME IS A WIRE CONTRACT. The producer writes it and the consumer
+// reads it; a rename on one side alone is a consumer that silently sees every
+// record as having no identity.
+func TestDedupeHeaderNameIsStable(t *testing.T) {
+	if DedupeHeader != "kafka-lab-event-id" {
+		t.Fatalf("the header was renamed to %q; both sides read this constant, but a stored topic does not", DedupeHeader)
+	}
+}

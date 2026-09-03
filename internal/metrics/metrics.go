@@ -64,6 +64,34 @@ type Set struct {
 	// how you tell "the slider did nothing" from "the slider's message never
 	// arrived" without reading a log.
 	ControlApplied prometheus.Counter
+
+	// ── delivery semantics ──────────────────────────────────────────────
+	//
+	// FOUR OUTCOMES, ALL MEASUREMENTS, AND EVERY RECORD LANDS IN EXACTLY ONE.
+	// Consumed above says how many records went past, which cannot distinguish
+	// a topic delivering every record twice from a topic carrying twice as many
+	// records. These four can.
+
+	// Applied counts records whose effect ran, first applications and repeats
+	// alike. A MEASUREMENT.
+	Applied prometheus.Counter
+
+	// Suppressed counts records the idempotency store recognised as already
+	// applied, so their effect did NOT run. It is zero unless dedupe is on.
+	// A MEASUREMENT.
+	Suppressed prometheus.Counter
+
+	// DoubleApplied counts records whose effect ran for a key it had already
+	// run for. It is the defect the dedupe store exists to remove, counted on
+	// BOTH arms so the two are comparable, and it is a LOWER BOUND — a key
+	// evicted from the bounded tally stops being recognisable as a repeat.
+	// A MEASUREMENT.
+	DoubleApplied prometheus.Counter
+
+	// NoDedupeKey counts records that carried no identity header. They are
+	// applied and counted here rather than dropped or quietly treated as
+	// deduplicated. A MEASUREMENT.
+	NoDedupeKey prometheus.Counter
 }
 
 // Role names which service a Set belongs to. It becomes the `service` label, so
@@ -121,6 +149,26 @@ func New(role Role) *Set {
 			Help:        "Settings records read from the control topic and applied.",
 			ConstLabels: labels,
 		}),
+		Applied: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: Namespace, Name: "applied_total",
+			Help:        "Records whose effect ran, repeats included. A MEASUREMENT.",
+			ConstLabels: labels,
+		}),
+		Suppressed: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: Namespace, Name: "duplicates_suppressed_total",
+			Help:        "Redeliveries the idempotency store recognised, whose effect did NOT run. A MEASUREMENT.",
+			ConstLabels: labels,
+		}),
+		DoubleApplied: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: Namespace, Name: "double_applied_total",
+			Help:        "Records whose effect ran for a key it had already run for. A MEASUREMENT, and a LOWER BOUND.",
+			ConstLabels: labels,
+		}),
+		NoDedupeKey: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: Namespace, Name: "records_without_dedupe_key_total",
+			Help:        "Records that carried no identity header. Applied, and counted here rather than dropped. A MEASUREMENT.",
+			ConstLabels: labels,
+		}),
 	}
 
 	reg.MustRegister(collectors.NewGoCollector())
@@ -131,7 +179,8 @@ func New(role Role) *Set {
 	case RoleProducer:
 		reg.MustRegister(s.Produced, s.RateLimit)
 	case RoleConsumer:
-		reg.MustRegister(s.Consumed, s.RateLimit, s.WorkMillis)
+		reg.MustRegister(s.Consumed, s.RateLimit, s.WorkMillis,
+			s.Applied, s.Suppressed, s.DoubleApplied, s.NoDedupeKey)
 	case RoleAdmin:
 		reg.MustRegister(s.Lag)
 	}

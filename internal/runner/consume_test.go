@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,40 +15,81 @@ import (
 
 // fakeFetcher hands out fixed batches and then blocks until the context ends,
 // so a test can assert exactly what one batch does.
+//
+// A batch is described by its SIZE and the records are synthesised, because
+// almost every test here is about the throttle rather than about the payload.
+// The few that care what a record carries set `records` instead.
 type fakeFetcher struct {
 	mu       sync.Mutex
 	batches  []int
+	records  [][]Record
 	fetchErr []error
 	fetches  atomic.Int64
 	commits  atomic.Int64
 	commitEr error
 }
 
-func (f *fakeFetcher) Fetch(ctx context.Context) (int, error) {
+func (f *fakeFetcher) Fetch(ctx context.Context) ([]Record, error) {
 	i := int(f.fetches.Add(1)) - 1
 
 	f.mu.Lock()
-	var n int
+	var recs []Record
 	var err error
-	if i < len(f.batches) {
-		n = f.batches[i]
+	switch {
+	case i < len(f.records):
+		recs = f.records[i]
+	case i < len(f.batches):
+		recs = synth(i, f.batches[i])
 	}
 	if i < len(f.fetchErr) {
 		err = f.fetchErr[i]
 	}
-	exhausted := i >= len(f.batches) && i >= len(f.fetchErr)
+	exhausted := i >= len(f.batches) && i >= len(f.records) && i >= len(f.fetchErr)
 	f.mu.Unlock()
 
 	if exhausted {
 		<-ctx.Done()
-		return 0, ctx.Err()
+		return nil, ctx.Err()
 	}
-	return n, err
+	return recs, err
+}
+
+// synth builds n distinct records for batch b.
+func synth(b, n int) []Record {
+	recs := make([]Record, n)
+	for i := range recs {
+		recs[i] = Record{
+			DedupeKey: "b" + strconv.Itoa(b) + "-r" + strconv.Itoa(i),
+			Partition: int32(b % 3),
+			Offset:    int64(b*1000 + i),
+		}
+	}
+	return recs
 }
 
 func (f *fakeFetcher) Commit(context.Context) error {
 	f.commits.Add(1)
 	return f.commitEr
+}
+
+// recordSink keeps every record it was handed, in order.
+type recordSink struct {
+	mu   sync.Mutex
+	recs []Record
+	n    atomic.Int64
+}
+
+func (a *recordSink) Apply(r Record) {
+	a.mu.Lock()
+	a.recs = append(a.recs, r)
+	a.mu.Unlock()
+	a.n.Add(1)
+}
+
+func (a *recordSink) snapshotRecords() []Record {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]Record(nil), a.recs...)
 }
 
 // countingSleeper records the delays asked for WITHOUT SPENDING THEM. A test
@@ -79,21 +121,70 @@ func workAt(ms int64) *atomic.Int64 {
 
 func TestConsumeLoopProcessesEveryRecordInABatch(t *testing.T) {
 	f := &fakeFetcher{batches: []int{5}}
-	var consumed atomic.Int64
+	a := &recordSink{}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	err := ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
-		&countingSleeper{}, f, func() { consumed.Add(1) }, nil)
+		&countingSleeper{}, f, a, nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v", err)
 	}
-	if consumed.Load() != 5 {
-		t.Fatalf("consumed %d of 5", consumed.Load())
+	if a.n.Load() != 5 {
+		t.Fatalf("applied %d of 5", a.n.Load())
 	}
 	if f.commits.Load() != 1 {
 		t.Fatalf("committed %d times, want 1 per batch", f.commits.Load())
+	}
+}
+
+// THE LOOP HANDS THE WHOLE RECORD TO THE APPLIER, not a count. A count cannot
+// say whether the SAME record went past twice, which is the only question a
+// delivery-semantics demo is about.
+func TestConsumeLoopPassesEachRecordThroughIntact(t *testing.T) {
+	want := []Record{
+		{DedupeKey: "run:1", Partition: 0, Offset: 100},
+		{DedupeKey: "run:2", Partition: 2, Offset: 101},
+		{DedupeKey: "", Partition: 1, Offset: 7}, // no identity, still delivered
+	}
+	f := &fakeFetcher{records: [][]Record{want}}
+	a := &recordSink{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
+		&countingSleeper{}, f, a, nil)
+
+	got := a.snapshotRecords()
+	if len(got) != len(want) {
+		t.Fatalf("applied %d records, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("record %d: got %+v want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// A record with no dedupe header must reach the applier with an EMPTY key. The
+// loop inventing one would make every redelivery look new, which is worse than
+// admitting the record cannot be deduplicated.
+func TestConsumeLoopDoesNotSynthesiseAMissingDedupeKey(t *testing.T) {
+	f := &fakeFetcher{records: [][]Record{{{Partition: 4, Offset: 9}}}}
+	a := &recordSink{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
+		&countingSleeper{}, f, a, nil)
+
+	got := a.snapshotRecords()
+	if len(got) != 1 {
+		t.Fatalf("applied %d records, want 1", len(got))
+	}
+	if got[0].DedupeKey != "" {
+		t.Fatalf("the loop invented the key %q", got[0].DedupeKey)
 	}
 }
 
@@ -104,20 +195,19 @@ func TestConsumeLoopProcessesEveryRecordInABatch(t *testing.T) {
 func TestConsumeLoopThrottlesPerRecordNotPerBatch(t *testing.T) {
 	f := &fakeFetcher{batches: []int{4}}
 	lim := ratelimit.New(20) // 50ms apart
-	var consumed atomic.Int64
+	a := &recordSink{}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
-	_ = ConsumeLoop(ctx, quiet(), lim, workAt(0), &countingSleeper{}, f,
-		func() { consumed.Add(1) }, nil)
+	_ = ConsumeLoop(ctx, quiet(), lim, workAt(0), &countingSleeper{}, f, a, nil)
 	elapsed := time.Since(start)
 
 	// Four records at 20/s is three inter-record gaps: ~150ms. A per-batch
 	// throttle would have finished in one gap.
-	if consumed.Load() < 4 {
-		t.Fatalf("consumed %d of 4 in %v", consumed.Load(), elapsed)
+	if a.n.Load() < 4 {
+		t.Fatalf("applied %d of 4 in %v", a.n.Load(), elapsed)
 	}
 	if elapsed < 100*time.Millisecond {
 		t.Fatalf("a 4-record batch at 20/s finished in %v; the throttle is per batch", elapsed)
@@ -169,18 +259,19 @@ func TestConsumeLoopSkipsSleepingWhenWorkIsZero(t *testing.T) {
 
 func TestConsumeLoopSurvivesFetchFailures(t *testing.T) {
 	f := &fakeFetcher{batches: []int{0, 2}, fetchErr: []error{errFake, nil}}
-	var consumed, reported atomic.Int64
+	a := &recordSink{}
+	var reported atomic.Int64
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
-		&countingSleeper{}, f, func() { consumed.Add(1) }, func(error) { reported.Add(1) })
+		&countingSleeper{}, f, a, func(error) { reported.Add(1) })
 
 	if reported.Load() != 1 {
 		t.Fatalf("reported %d fetch errors, want 1", reported.Load())
 	}
-	if consumed.Load() != 2 {
-		t.Fatalf("the loop did not recover: consumed %d", consumed.Load())
+	if a.n.Load() != 2 {
+		t.Fatalf("the loop did not recover: applied %d", a.n.Load())
 	}
 }
 
@@ -272,6 +363,10 @@ func TestConsumeLoopToleratesNilCallbacks(t *testing.T) {
 		workAt(0), &countingSleeper{}, f, nil, nil)
 }
 
+func TestNopApplierApplies(t *testing.T) {
+	nopApplier{}.Apply(Record{DedupeKey: "a"}) // must not panic
+}
+
 func TestIsContextError(t *testing.T) {
 	if !isContextError(context.Canceled) || !isContextError(context.DeadlineExceeded) {
 		t.Fatal("both context errors must be recognised")
@@ -295,15 +390,15 @@ func waitForCount(s *countingSleeper, n int) {
 // go round again rather than committing nothing or treating it as shutdown.
 func TestConsumeLoopContinuesAfterAnEmptyFetch(t *testing.T) {
 	f := &fakeFetcher{batches: []int{0, 3}}
-	var consumed atomic.Int64
+	a := &recordSink{}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
-		&countingSleeper{}, f, func() { consumed.Add(1) }, nil)
+		&countingSleeper{}, f, a, nil)
 
-	if consumed.Load() != 3 {
-		t.Fatalf("consumed %d; an empty fetch stopped the loop", consumed.Load())
+	if a.n.Load() != 3 {
+		t.Fatalf("applied %d; an empty fetch stopped the loop", a.n.Load())
 	}
 	if f.commits.Load() != 1 {
 		t.Fatalf("commits: got %d want 1 — the empty batch must not commit", f.commits.Load())

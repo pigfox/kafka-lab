@@ -11,6 +11,8 @@
 package event
 
 import (
+	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -138,3 +140,44 @@ func (e Event) Age(now time.Time) time.Duration {
 // input is a future field, and a wrap that has never run is a wrap that has
 // never been shown to name the sequence number it claims to name.
 var marshal = json.Marshal
+
+// DedupeHeader is the record header carrying each event's identity, read by
+// the consumer's idempotency store and written by the producer.
+//
+// The record key is the REGION — one of the four values in Regions — so it
+// names a partition and cannot identify a record. The sequence number is in
+// the payload, but taking the identity from there would require the consumer to
+// unmarshal every value before it could tell one delivery from another, which
+// makes a message's identity depend on the value schema.
+const DedupeHeader = "kafka-lab-event-id"
+
+// dedupeSeparator joins the run nonce to the sequence number. The nonce is
+// hex, so it cannot contain this byte and the two halves stay separable.
+const dedupeSeparator = ":"
+
+// DedupeID builds the header value for one event: the producer's run nonce,
+// a separator, and the sequence number.
+//
+// THE NONCE IS WHAT MAKES THE ID UNIQUE ACROSS RUNS. Seq restarts at 1 every
+// time the producer process starts, so a bare sequence number would collide
+// with the previous run's on a topic that retains ten minutes — and a consumer
+// deduplicating on it would discard the new run's first messages as duplicates
+// of the old run's.
+func DedupeID(nonce string, seq uint64) string {
+	return nonce + dedupeSeparator + strconv.FormatUint(seq, 10)
+}
+
+// NewRunNonce returns a fresh 16-character hex nonce for one producer run.
+func NewRunNonce() (string, error) {
+	b := make([]byte, 8)
+	if _, err := randRead(b); err != nil {
+		return "", fmt.Errorf("event: run nonce: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// randRead is a variable for the same reason marshal above is one: crypto/rand
+// on every platform this lab runs on does not fail, so the error branch has no
+// reachable input in production and would be an untested wrap claiming to name
+// something it has never named.
+var randRead = crand.Read

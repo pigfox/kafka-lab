@@ -145,6 +145,24 @@ services:
     environment:
       KAFKA_BROKERS: "kafka:9092"
       KL_METRICS_ADDR: ":2112"
+      # ── delivery semantics ─────────────────────────────────────────────
+      #
+      # DEDUPE IS OFF BY DEFAULT, and that is the honest default rather than a
+      # cautious one: at-least-once is what Kafka gives, so a lab whose default
+      # arm hid the duplicates would teach the wrong lesson. Export
+      # KL_DEDUPE=true and bring the lab up again to run the other arm; no code
+      # changes, and every other setting stays where it is.
+      #
+      # The store is bounded and IN-PROCESS. Its guarantee does not survive a
+      # restart or a partition rebalance, and a key evicted for capacity or age
+      # is a key whose redelivery reads as first-seen — see internal/idem, which
+      # says so at length and counts both losses.
+      KL_DEDUPE: "${KL_DEDUPE:-false}"
+      # How many keys the dedupe store holds, and for how long. The TTL matches
+      # the events topic's ten-minute retention: a record the broker has aged
+      # out cannot be redelivered, so remembering its key longer buys nothing.
+      KL_DEDUPE_CAPACITY: "${KL_DEDUPE_CAPACITY:-50000}"
+      KL_DEDUPE_TTL: "${KL_DEDUPE_TTL:-10m}"
     restart: unless-stopped
 
   # ── the control plane ──────────────────────────────────────────────────────

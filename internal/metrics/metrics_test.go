@@ -183,3 +183,91 @@ func TestNamespaceIsStable(t *testing.T) {
 		t.Fatalf("namespace changed to %q; the dashboard queries kafka_lab", Namespace)
 	}
 }
+
+// The four delivery-semantics counters belong to the CONSUMER alone. A producer
+// publishing a flat zero double_applied_total would put a reassuring line on a
+// panel about a property it does not participate in.
+func TestOnlyTheConsumerExposesTheDeliverySemanticsCounters(t *testing.T) {
+	deliverySeries := []string{
+		"kafka_lab_applied_total",
+		"kafka_lab_duplicates_suppressed_total",
+		"kafka_lab_double_applied_total",
+		"kafka_lab_records_without_dedupe_key_total",
+	}
+
+	consumer := New(RoleConsumer)
+	touchAll(consumer)
+	got := names(t, consumer)
+	for _, w := range deliverySeries {
+		if !got[w] {
+			t.Fatalf("the consumer must expose %s; has %v", w, got)
+		}
+	}
+
+	for _, role := range []Role{RoleProducer, RoleAdmin} {
+		s := New(role)
+		touchAll(s)
+		got := names(t, s)
+		for _, d := range deliverySeries {
+			if got[d] {
+				t.Fatalf("%s must not expose %s", role, d)
+			}
+		}
+	}
+}
+
+// The four outcomes are distinct series, so a dashboard cannot conflate the
+// defect (double applied) with the fix (suppressed) or with the honest gap
+// (no dedupe key).
+func TestTheFourOutcomesAreSeparatelyReadable(t *testing.T) {
+	s := New(RoleConsumer)
+	s.Applied.Add(10)
+	s.Suppressed.Add(4)
+	s.DoubleApplied.Add(3)
+	s.NoDedupeKey.Add(2)
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+
+	for _, want := range []string{
+		`kafka_lab_applied_total{service="consumer"} 10`,
+		`kafka_lab_duplicates_suppressed_total{service="consumer"} 4`,
+		`kafka_lab_double_applied_total{service="consumer"} 3`,
+		`kafka_lab_records_without_dedupe_key_total{service="consumer"} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q in:\n%s", want, body)
+		}
+	}
+}
+
+// Consumed counts records that went past; Applied counts effects that ran. They
+// are different questions and must not be the same series.
+func TestConsumedAndAppliedAreDistinctSeries(t *testing.T) {
+	s := New(RoleConsumer)
+	s.Consumed.Add(7)
+	s.Applied.Add(9)
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `kafka_lab_consumed_total{service="consumer"} 7`) {
+		t.Fatalf("consumed_total is wrong:\n%s", body)
+	}
+	if !strings.Contains(body, `kafka_lab_applied_total{service="consumer"} 9`) {
+		t.Fatalf("applied_total is wrong:\n%s", body)
+	}
+}
+
+// touchAll makes every counter in a set appear in a gather. Counters register
+// at zero but only surface once touched.
+func touchAll(s *Set) {
+	for _, c := range []prometheus.Counter{
+		s.Errors, s.ControlApplied, s.Produced, s.Consumed,
+		s.Applied, s.Suppressed, s.DoubleApplied, s.NoDedupeKey,
+	} {
+		c.Add(0)
+	}
+}

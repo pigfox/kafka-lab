@@ -78,6 +78,19 @@ func run(log *slog.Logger) error {
 	watcher := kafkabus.NewWatcher(controlCl, log, func() { m.ControlApplied.Inc() })
 	gen := event.New(int64(seed), filler)
 
+	// ONE NONCE PER RUN, GENERATED HERE AND NOWHERE ELSE. Every record this
+	// process emits carries it, so the consumer can tell this run's message #1
+	// from the previous run's — the sequence number restarts at 1 on every
+	// start, and the events topic retains ten minutes, so the two overlap.
+	// A failure to read entropy stops the producer rather than falling back to
+	// a fixed value: a predictable nonce is a nonce that collides, and a
+	// consumer would then discard this run's opening messages as duplicates.
+	nonce, err := event.NewRunNonce()
+	if err != nil {
+		return err
+	}
+	log.Info("producer run identity", "nonce", nonce, "header", event.DedupeHeader)
+
 	errs := make(chan error, 3)
 	go func() { errs <- watcher.Run(ctx) }()
 	go func() {
@@ -85,7 +98,7 @@ func run(log *slog.Logger) error {
 	}()
 	go func() {
 		errs <- runner.ProduceLoop(ctx, log, lim,
-			&emitter{cl: producerCl, gen: gen, m: m},
+			&emitter{cl: producerCl, gen: gen, m: m, nonce: nonce},
 			func(error) { m.Errors.Inc() })
 	}()
 
@@ -105,6 +118,16 @@ func (a applier) Apply(s control.Settings) {
 	a.m.RateLimit.Set(s.ProducerRatePerSec)
 }
 
+// produceClient is the produce call as the emitter needs it.
+//
+// IT IS AN INTERFACE SO THE RECORD IS ASSERTABLE. What the producer puts on the
+// wire — the partition key and the identity header — is now a contract with the
+// consumer, and a contract that can only be checked by running eight containers
+// is a contract that gets checked once.
+type produceClient interface {
+	Produce(ctx context.Context, r *kgo.Record, promise func(*kgo.Record, error))
+}
+
 // emitter produces one event.
 //
 // IT PRODUCES ASYNCHRONOUSLY and counts on the CALLBACK, not at the call site.
@@ -114,9 +137,10 @@ func (a applier) Apply(s control.Settings) {
 // produced_total counts ACKNOWLEDGED records — a record that failed is an
 // error, not throughput.
 type emitter struct {
-	cl  *kgo.Client
-	gen *event.Generator
-	m   *metrics.Set
+	cl    produceClient
+	gen   *event.Generator
+	m     *metrics.Set
+	nonce string
 }
 
 func (e *emitter) Emit(ctx context.Context) error {
@@ -125,7 +149,21 @@ func (e *emitter) Emit(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	e.cl.Produce(ctx, &kgo.Record{Key: ev.Key(), Value: value}, func(_ *kgo.Record, err error) {
+	// THE KEY AND THE HEADER ANSWER DIFFERENT QUESTIONS, and swapping them is
+	// the mistake this arrangement exists to prevent. The KEY is the region,
+	// which decides the PARTITION — four values, chosen so partitions carry
+	// related records and the topic is worth browsing. The HEADER is the
+	// record's IDENTITY, which the consumer deduplicates on. A key used as an
+	// identity would collapse the whole stream to four messages.
+	rec := &kgo.Record{
+		Key:   ev.Key(),
+		Value: value,
+		Headers: []kgo.RecordHeader{{
+			Key:   event.DedupeHeader,
+			Value: []byte(event.DedupeID(e.nonce, ev.Seq)),
+		}},
+	}
+	e.cl.Produce(ctx, rec, func(_ *kgo.Record, err error) {
 		if err != nil {
 			e.m.Errors.Inc()
 			return

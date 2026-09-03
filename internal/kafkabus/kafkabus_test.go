@@ -371,3 +371,60 @@ func TestEnsureTopicsClassificationOrder(t *testing.T) {
 		}
 	}
 }
+
+// ── autocommit is off, and this proves it rather than trusting the source ──
+//
+// kgo options are opaque values: a test cannot read what they set. What it CAN
+// do is hand them to the config validator, which rejects DisableAutoCommit
+// alongside GreedyAutoCommit. So adding the greedy option to the working
+// consumer's set must be an ERROR, and that error is only possible if
+// DisableAutoCommit is in there.
+//
+// WHY THIS IS WORTH A TEST. franz-go turns autocommit ON by default for any
+// client in a group and commits every five seconds. With it on, the explicit
+// per-batch commit is no longer the boundary the consume loop's comment says it
+// is: the window between applying a record and committing its offset — the
+// window where at-least-once lives — closes itself on a timer, and any
+// experiment about duplicates would be measuring that timer instead. Nothing
+// about a re-enabled default would fail visibly; the lab would keep running and
+// quietly stop demonstrating the thing it is about.
+func TestTheWorkingConsumerDisablesAutocommit(t *testing.T) {
+	opts := append(ConsumerOpts(), kgo.SeedBrokers("127.0.0.1:19092"), kgo.GreedyAutoCommit())
+	cl, err := kgo.NewClient(opts...)
+	if err == nil {
+		cl.Close()
+		t.Fatal("greedy autocommit was accepted alongside ConsumerOpts; DisableAutoCommit is not in the set")
+	}
+	if !strings.Contains(err.Error(), "disable autocommitting") {
+		t.Fatalf("the client was rejected for some other reason: %v", err)
+	}
+}
+
+// THE OTHER DIRECTION, so the test above cannot pass because greedy autocommit
+// is simply always rejected. The same group options WITHOUT DisableAutoCommit
+// accept it.
+func TestGreedyAutocommitIsAcceptedWithoutTheDisableOption(t *testing.T) {
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19092"),
+		kgo.ConsumeTopics(control.EventsTopic),
+		kgo.ConsumerGroup(ConsumerGroup),
+		kgo.GreedyAutoCommit(),
+	)
+	if err != nil {
+		t.Fatalf("greedy autocommit is rejected on its own, so the guard above proves nothing: %v", err)
+	}
+	cl.Close()
+}
+
+// The working consumer's set is the one that changed; the other two are
+// untouched by the autocommit ruling.
+func TestConsumerOptsCarryTheTopicGroupOffsetAndCommitPolicy(t *testing.T) {
+	if got := len(ConsumerOpts()); got != 4 {
+		t.Fatalf("consumer opts: got %d, want 4 (topic, group, reset offset, disable autocommit)", got)
+	}
+	cl, err := kgo.NewClient(append(ConsumerOpts(), kgo.SeedBrokers("127.0.0.1:19092"))...)
+	if err != nil {
+		t.Fatalf("consumer opts rejected by kgo: %v", err)
+	}
+	cl.Close()
+}
