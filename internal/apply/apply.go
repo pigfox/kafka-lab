@@ -52,11 +52,18 @@ const DefaultTTL = 10 * time.Minute
 
 // Observer is told what happened to each record, so a caller can publish the
 // four outcomes without this package importing a metrics library.
+//
+// EACH METHOD TAKES THE RECORD, not just the fact that it happened. Suppressed
+// and DoubleApplied are the two ways a REDELIVERY shows up — suppressed on the
+// dedupe arm, applied a second time on the other — so a caller holding the
+// record can log the key, partition and offset of every duplicate as it lands.
+// That log is the evidence a published duplicate count is checked against, and
+// a bare counter cannot produce it.
 type Observer interface {
-	Applied()
-	Suppressed()
-	DoubleApplied()
-	NoKey()
+	Applied(r runner.Record)
+	Suppressed(r runner.Record)
+	DoubleApplied(r runner.Record)
+	NoKey(r runner.Record)
 }
 
 // Counts is a snapshot of the four outcomes.
@@ -109,10 +116,10 @@ func New(opts Options) *Applier {
 		obs:         opts.Observer,
 	}
 	if a.seen == nil {
-		a.seen = idem.New(DefaultCapacity, DefaultTTL, nil)
+		a.seen = idem.New(DefaultCapacity, DefaultTTL, nil, nil)
 	}
 	if a.appliedKeys == nil {
-		a.appliedKeys = idem.New(DefaultCapacity, DefaultTTL, nil)
+		a.appliedKeys = idem.New(DefaultCapacity, DefaultTTL, nil, nil)
 	}
 	if a.effect == nil {
 		a.effect = func(runner.Record) {}
@@ -133,20 +140,20 @@ func New(opts Options) *Applier {
 func (a *Applier) Apply(r runner.Record) {
 	if r.DedupeKey == "" {
 		a.nNoKey.Add(1)
-		a.obs.NoKey()
+		a.obs.NoKey(r)
 		a.run(r)
 		return
 	}
 
 	if a.dedupe && a.seen.Observe(r.DedupeKey) > 0 {
 		a.nSuppressed.Add(1)
-		a.obs.Suppressed()
+		a.obs.Suppressed(r)
 		return
 	}
 
 	if a.appliedKeys.Observe(r.DedupeKey) > 0 {
 		a.nDouble.Add(1)
-		a.obs.DoubleApplied()
+		a.obs.DoubleApplied(r)
 	}
 	a.run(r)
 }
@@ -157,7 +164,7 @@ func (a *Applier) Apply(r runner.Record) {
 func (a *Applier) run(r runner.Record) {
 	a.effect(r)
 	a.nApplied.Add(1)
-	a.obs.Applied()
+	a.obs.Applied(r)
 }
 
 // Counts returns a snapshot of the four outcomes.
@@ -184,7 +191,7 @@ func (a *Applier) AppliedKeys() *idem.Set { return a.appliedKeys }
 // nopObserver ignores every outcome.
 type nopObserver struct{}
 
-func (nopObserver) Applied()       {}
-func (nopObserver) Suppressed()    {}
-func (nopObserver) DoubleApplied() {}
-func (nopObserver) NoKey()         {}
+func (nopObserver) Applied(runner.Record)       {}
+func (nopObserver) Suppressed(runner.Record)    {}
+func (nopObserver) DoubleApplied(runner.Record) {}
+func (nopObserver) NoKey(runner.Record)         {}

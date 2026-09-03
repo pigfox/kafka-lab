@@ -163,6 +163,26 @@ services:
       # out cannot be redelivered, so remembering its key longer buys nothing.
       KL_DEDUPE_CAPACITY: "${KL_DEDUPE_CAPACITY:-50000}"
       KL_DEDUPE_TTL: "${KL_DEDUPE_TTL:-10m}"
+      # ── fault injection ────────────────────────────────────────────────
+      #
+      # OFF BY DEFAULT (rate 0). The rate is the fraction of DISTINCT KEYS
+      # whose commit is replaced by a rewind of the consume cursor back to that
+      # record — which is what actually produces a redelivery. Skipping the
+      # commit alone produces none: franz-go advances its cursor in memory on
+      # every poll and reads the committed offset back only when a partition is
+      # assigned, so an uncommitted batch is simply never seen again.
+      #
+      # A REWIND REDELIVERS A TAIL. The cursor is per-partition, so seeking back
+      # to one record replays it and everything after it in that partition that
+      # had already been polled. Duplicates therefore EXCEED injected faults,
+      # and the multiplier is whatever the broker put in that batch.
+      #
+      # The seed makes the fault set a pure function of the record keys, so two
+      # runs with the same seed fault the same keys whatever the delivery order
+      # — which is the only reason a dedupe arm and an at-least-once arm can be
+      # compared at all.
+      KL_FAULT_RATE: "${KL_FAULT_RATE:-0}"
+      KL_FAULT_SEED: "${KL_FAULT_SEED:-kafka-lab}"
     restart: unless-stopped
 
   # ── the control plane ──────────────────────────────────────────────────────

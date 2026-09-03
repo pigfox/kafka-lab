@@ -92,7 +92,39 @@ type Set struct {
 	// applied and counted here rather than dropped or quietly treated as
 	// deduplicated. A MEASUREMENT.
 	NoDedupeKey prometheus.Counter
+
+	// ── what the bounded store forgot ───────────────────────────────────
+	//
+	// THESE ARE THE HONESTY METRICS, and they are the reason a double-apply
+	// figure can be read at all. The idempotency store is bounded, so it
+	// forgets: a key dropped for capacity or for age reads as first-seen when
+	// its redelivery arrives, the effect runs a second time, and the store
+	// reports nothing unusual. Without these two series a reader looking at a
+	// non-zero double_applied_total on the dedupe arm cannot tell a broken
+	// store from a store that was simply too small — and the two call for
+	// opposite responses.
+	//
+	// THEY CARRY A `store` LABEL because there are two sets with different
+	// jobs: `seen` decides suppression and is only consulted when dedupe is
+	// on, while `applied` is the per-key tally that makes a repeat
+	// recognisable and runs on both arms. Aggregating them would report a
+	// number that cannot be acted on.
+	//
+	// Both are MEASUREMENTS, and both should be zero on a run whose numbers
+	// are meant to be published.
+	Evictions *prometheus.CounterVec
+	Expiries  *prometheus.CounterVec
 }
+
+// Store names an idempotency set, for the `store` label on the loss counters.
+type Store string
+
+const (
+	// StoreSeen is the dedupe set: it decides suppression.
+	StoreSeen Store = "seen"
+	// StoreApplied is the per-key apply tally: it makes a repeat recognisable.
+	StoreApplied Store = "applied"
+)
 
 // Role names which service a Set belongs to. It becomes the `service` label, so
 // one Prometheus can hold all three without their series colliding.
@@ -169,6 +201,16 @@ func New(role Role) *Set {
 			Help:        "Records that carried no identity header. Applied, and counted here rather than dropped. A MEASUREMENT.",
 			ConstLabels: labels,
 		}),
+		Evictions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: Namespace, Name: "dedupe_evictions_total",
+			Help:        "Keys the bounded store dropped to stay under capacity. Each one is a guarantee lost. A MEASUREMENT.",
+			ConstLabels: labels,
+		}, []string{"store"}),
+		Expiries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: Namespace, Name: "dedupe_expiries_total",
+			Help:        "Keys the bounded store dropped for age. Each one is a guarantee lost. A MEASUREMENT.",
+			ConstLabels: labels,
+		}, []string{"store"}),
 	}
 
 	reg.MustRegister(collectors.NewGoCollector())
@@ -180,7 +222,18 @@ func New(role Role) *Set {
 		reg.MustRegister(s.Produced, s.RateLimit)
 	case RoleConsumer:
 		reg.MustRegister(s.Consumed, s.RateLimit, s.WorkMillis,
-			s.Applied, s.Suppressed, s.DoubleApplied, s.NoDedupeKey)
+			s.Applied, s.Suppressed, s.DoubleApplied, s.NoDedupeKey,
+			s.Evictions, s.Expiries)
+		// A CounterVec publishes nothing until a label combination exists, so
+		// a store that has lost nothing would be ABSENT from /metrics rather
+		// than zero. Absent and zero read identically to a careless eye and
+		// oppositely to Prometheus: `rate()` over a missing series is empty,
+		// not flat. Both stores are initialised here so a clean run says zero
+		// out loud.
+		for _, store := range []Store{StoreSeen, StoreApplied} {
+			s.Evictions.WithLabelValues(string(store)).Add(0)
+			s.Expiries.WithLabelValues(string(store)).Add(0)
+		}
 	case RoleAdmin:
 		reg.MustRegister(s.Lag)
 	}

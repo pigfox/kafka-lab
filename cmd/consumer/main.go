@@ -25,6 +25,7 @@ import (
 	"github.com/pigfox/kafka-lab/internal/config"
 	"github.com/pigfox/kafka-lab/internal/control"
 	"github.com/pigfox/kafka-lab/internal/event"
+	"github.com/pigfox/kafka-lab/internal/fault"
 	"github.com/pigfox/kafka-lab/internal/idem"
 	"github.com/pigfox/kafka-lab/internal/kafkabus"
 	"github.com/pigfox/kafka-lab/internal/metrics"
@@ -86,17 +87,28 @@ func run(log *slog.Logger) error {
 
 	deliveries := apply.New(apply.Options{
 		Dedupe:      dedupe,
-		Seen:        idem.New(dedupeCapacity, dedupeTTL, nil),
-		AppliedKeys: idem.New(dedupeCapacity, dedupeTTL, nil),
-		Observer:    observer{m: m},
+		Seen:        idem.New(dedupeCapacity, dedupeTTL, nil, lossOf(log, m, metrics.StoreSeen)),
+		AppliedKeys: idem.New(dedupeCapacity, dedupeTTL, nil, lossOf(log, m, metrics.StoreApplied)),
+		Observer:    observer{m: m, log: log},
 		// NO EFFECT IS ATTACHED. This lab has no business side effect to run,
 		// and inventing one would put a fabricated workload inside a
 		// measurement about delivery. applied_total IS the record of the
 		// effect running; a real consumer would pass its own function here.
 	})
+
+	// FAULT INJECTION IS OFF BY DEFAULT. The rate is the fraction of distinct
+	// keys whose commit is replaced by a cursor rewind — see internal/fault,
+	// which explains why skipping the commit alone produces no duplicate at
+	// all. The seed makes the fault set a pure function of the record keys, so
+	// both arms of an experiment are fed the same faults.
+	faultRate := config.Float("KL_FAULT_RATE", 0)
+	faultSeed := config.String("KL_FAULT_SEED", "kafka-lab")
+	injector := fault.New(faultRate, faultSeed)
+
 	log.Info("delivery semantics configured",
 		"dedupe", dedupe, "capacity", dedupeCapacity, "ttl", dedupeTTL,
-		"header", event.DedupeHeader)
+		"header", event.DedupeHeader,
+		"fault_rate", faultRate, "fault_seed", faultSeed)
 
 	watcher := kafkabus.NewWatcher(controlCl, log, func() { m.ControlApplied.Inc() })
 
@@ -107,8 +119,9 @@ func run(log *slog.Logger) error {
 	}()
 	go func() {
 		errs <- runner.ConsumeLoop(ctx, log, lim, work, runner.RealSleeper{},
-			&fetcher{cl: consumerCl},
+			&fetcher{cl: consumerCl, seeker: consumerCl},
 			drainCounter{m: m, inner: deliveries},
+			injector,
 			func(error) { m.Errors.Inc() })
 	}()
 
@@ -179,13 +192,56 @@ func (d drainCounter) Apply(r runner.Record) {
 	d.inner.Apply(r)
 }
 
-// observer publishes the four delivery outcomes.
-type observer struct{ m *metrics.Set }
+// observer publishes the four delivery outcomes, and logs the two of them that
+// are redeliveries.
+//
+// SUPPRESSED AND DOUBLE-APPLIED ARE THE SAME EVENT SEEN FROM THE TWO ARMS: a
+// record arriving whose key has been here before. On the dedupe arm its effect
+// is skipped; on the other it runs again. Logging both with the same message
+// and a `suppressed` field means one grep counts the redeliveries of either
+// run, and the count is checkable against the metric rather than derived from
+// it.
+type observer struct {
+	m   *metrics.Set
+	log *slog.Logger
+}
 
-func (o observer) Applied()       { o.m.Applied.Inc() }
-func (o observer) Suppressed()    { o.m.Suppressed.Inc() }
-func (o observer) DoubleApplied() { o.m.DoubleApplied.Inc() }
-func (o observer) NoKey()         { o.m.NoDedupeKey.Inc() }
+func (o observer) Applied(runner.Record) { o.m.Applied.Inc() }
+
+func (o observer) Suppressed(r runner.Record) {
+	o.m.Suppressed.Inc()
+	o.log.Info("redelivery", "key", r.DedupeKey, "partition", r.Partition,
+		"offset", r.Offset, "suppressed", true)
+}
+
+func (o observer) DoubleApplied(r runner.Record) {
+	o.m.DoubleApplied.Inc()
+	o.log.Info("redelivery", "key", r.DedupeKey, "partition", r.Partition,
+		"offset", r.Offset, "suppressed", false)
+}
+
+func (o observer) NoKey(runner.Record) { o.m.NoDedupeKey.Inc() }
+
+// lossOf builds the callback one idempotency store reports its forgotten keys
+// through.
+//
+// EVERY LOSS IS BOTH COUNTED AND NAMED. The counter is what a dashboard reads
+// and what decides whether a measured run is publishable at all — a double-apply
+// figure taken from a run whose store was overflowing measures the store, not
+// the delivery semantics. The log line names the key, so a loss can be traced to
+// the record it belongs to instead of being an anonymous increment.
+func lossOf(log *slog.Logger, m *metrics.Set, store metrics.Store) func(idem.Loss) {
+	return func(l idem.Loss) {
+		switch l.Reason {
+		case idem.LossCapacity:
+			m.Evictions.WithLabelValues(string(store)).Inc()
+		case idem.LossTTL:
+			m.Expiries.WithLabelValues(string(store)).Inc()
+		}
+		log.Warn("idempotency store forgot a key; its redelivery would read as new",
+			"store", string(store), "reason", string(l.Reason), "key", l.Key)
+	}
+}
 
 // fetcher adapts the kgo client to runner.Fetcher.
 //
@@ -193,7 +249,22 @@ func (o observer) NoKey()         { o.m.NoDedupeKey.Inc() }
 // and this group's COMMITTED offset, so a consumer that read everything and
 // committed nothing would leave the panel pinned at maximum while the messages
 // were long gone. The commit is the visible half of the drain.
-type fetcher struct{ cl *kgo.Client }
+//
+// IT HOLDS THE CLIENT TWICE, and that is a seam rather than an accident. `cl`
+// polls and commits, both of which need a broker and are exercised by running
+// the lab. `seeker` is the same client behind a one-method interface, because
+// the rewind is pure TRANSLATION — records to a topic/partition/epoch/offset map
+// — and translating an epoch wrongly is a silent resume at the wrong place. That
+// translation is worth asserting without eight containers.
+type fetcher struct {
+	cl     *kgo.Client
+	seeker offsetSeeker
+}
+
+// offsetSeeker is the cursor seek as this file needs it. *kgo.Client satisfies it.
+type offsetSeeker interface {
+	SetOffsets(map[string]map[int32]kgo.EpochOffset)
+}
 
 func (f *fetcher) Fetch(ctx context.Context) ([]runner.Record, error) {
 	// A bounded poll rather than an indefinite one: the loop must come back
@@ -221,15 +292,45 @@ func (f *fetcher) Commit(ctx context.Context) error {
 	return f.cl.CommitUncommittedOffsets(ctx)
 }
 
+// Rewind seeks each target's partition back to that record's offset, so it and
+// everything after it in that partition is delivered again.
+//
+// IT TAKES NO CONTEXT AND CANNOT FAIL. SetOffsets is a local re-assignment of
+// the client's own consume cursor — it sends nothing to the broker and returns
+// nothing — so an error return here would be a value that is always nil,
+// checked at a call site that could never do anything about it.
+//
+// THE EPOCH IS THE RECORD'S OWN, not -1. franz-go documents LeaderEpoch as what
+// "clients use for data loss detection": seeking with the real epoch lets the
+// broker say that the log has been truncated beneath us, while -1 waives the
+// check and resumes at whatever now sits at that offset.
+func (f *fetcher) Rewind(to []runner.Record) {
+	set := make(map[string]map[int32]kgo.EpochOffset, 1)
+	for _, r := range to {
+		byPartition, ok := set[r.Topic]
+		if !ok {
+			byPartition = make(map[int32]kgo.EpochOffset, len(to))
+			set[r.Topic] = byPartition
+		}
+		byPartition[r.Partition] = kgo.EpochOffset{
+			Epoch:  r.LeaderEpoch,
+			Offset: r.Offset,
+		}
+	}
+	f.seeker.SetOffsets(set)
+}
+
 // toRunnerRecords lifts franz-go records into the library-agnostic type the
 // consume loop takes, so no kgo type crosses into internal/runner.
 func toRunnerRecords(rs []*kgo.Record) []runner.Record {
 	out := make([]runner.Record, len(rs))
 	for i, r := range rs {
 		out[i] = runner.Record{
-			DedupeKey: dedupeKeyOf(r),
-			Partition: r.Partition,
-			Offset:    r.Offset,
+			DedupeKey:   dedupeKeyOf(r),
+			Topic:       r.Topic,
+			Partition:   r.Partition,
+			Offset:      r.Offset,
+			LeaderEpoch: r.LeaderEpoch,
 		}
 	}
 	return out

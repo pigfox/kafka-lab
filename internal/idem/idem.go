@@ -49,6 +49,30 @@ type RealClock struct{}
 // Now returns the current time.
 func (RealClock) Now() time.Time { return time.Now() }
 
+// LossReason says which of the two bounds dropped a key.
+type LossReason string
+
+const (
+	// LossCapacity is the oldest key being dropped to make room for a new one.
+	LossCapacity LossReason = "capacity"
+	// LossTTL is a key being dropped for age.
+	LossTTL LossReason = "ttl"
+)
+
+// Loss is one forgotten key.
+//
+// IT IS A CALLBACK RATHER THAN A COUNTER TO READ LATER, because the two are not
+// equivalent for the thing that matters. Evictions and Expiries below are
+// totals a caller can poll, which is enough to answer "did we lose anything?"
+// at the end of a run. A callback fires AT THE MOMENT OF THE LOSS and names the
+// key, which is what lets a Prometheus counter move in real time and a log line
+// say which record's guarantee just went. A poll can only ever say that some
+// key, at some point, was forgotten.
+type Loss struct {
+	Key    string
+	Reason LossReason
+}
+
 // entry is one remembered key. The deadline is measured from the FIRST
 // sighting and is NOT refreshed by later ones — the window means "we remember
 // this key for ttl after first seeing it", not "for ttl after last seeing it".
@@ -68,6 +92,7 @@ type Set struct {
 	clock    Clock
 	byKey    map[string]*list.Element
 	order    *list.List // front is the oldest first-sighting
+	onLoss   func(Loss)
 	evicted  uint64
 	expired  uint64
 }
@@ -77,10 +102,21 @@ type Set struct {
 // A capacity below one is raised to one: a set that holds nothing would answer
 // first-seen to everything, which is a store that silently does not exist. A
 // ttl of zero or less means entries never expire on time and capacity alone
-// bounds the set. A nil clock reads the wall clock.
-func New(capacity int, ttl time.Duration, clock Clock) *Set {
+// bounds the set. A nil clock reads the wall clock, and a nil onLoss reports
+// nothing.
+//
+// onLoss IS CALLED WITH THE SET'S LOCK HELD, so it must not call back into this
+// set — a re-entrant callback deadlocks. Incrementing a counter or writing a log
+// line is what it is for. It is called under the lock deliberately rather than
+// deferred to after the unlock: a loss reported out of order with the Observe
+// that caused it would let a reader see a key answer first-seen before the
+// notice explaining why.
+func New(capacity int, ttl time.Duration, clock Clock, onLoss func(Loss)) *Set {
 	if capacity < 1 {
 		capacity = 1
+	}
+	if onLoss == nil {
+		onLoss = func(Loss) {}
 	}
 	if clock == nil {
 		clock = RealClock{}
@@ -91,6 +127,7 @@ func New(capacity int, ttl time.Duration, clock Clock) *Set {
 		clock:    clock,
 		byKey:    make(map[string]*list.Element, capacity),
 		order:    list.New(),
+		onLoss:   onLoss,
 	}
 }
 
@@ -121,8 +158,10 @@ func (s *Set) Observe(key string) int {
 	if s.order.Len() >= s.capacity {
 		el := s.order.Front()
 		s.order.Remove(el)
-		delete(s.byKey, el.Value.(*entry).key)
+		victim := el.Value.(*entry).key
+		delete(s.byKey, victim)
 		s.evicted++
+		s.onLoss(Loss{Key: victim, Reason: LossCapacity})
 	}
 
 	e := &entry{key: key, count: 1}
@@ -152,6 +191,7 @@ func (s *Set) expire(now time.Time) {
 		s.order.Remove(el)
 		delete(s.byKey, e.key)
 		s.expired++
+		s.onLoss(Loss{Key: e.key, Reason: LossTTL})
 	}
 }
 

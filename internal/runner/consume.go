@@ -24,10 +24,18 @@ import (
 // delivery, so a redelivery would carry a different key and the idempotency
 // store would report it as first-seen. An empty key is a record that cannot be
 // deduplicated, and saying so is the only honest answer.
+// Topic, Partition, Offset and LeaderEpoch are what a rewind needs: a cursor
+// seek is addressed by topic and partition, and the LEADER EPOCH is carried
+// rather than defaulted to -1 because it is what lets the broker detect that
+// the offset being sought belongs to a log that has since been truncated. A -1
+// disables that check, which would turn a data-loss condition into a silent
+// resume at the wrong place.
 type Record struct {
-	DedupeKey string
-	Partition int32
-	Offset    int64
+	DedupeKey   string
+	Topic       string
+	Partition   int32
+	Offset      int64
+	LeaderEpoch int32
 }
 
 // RecordApplier performs one record's effect.
@@ -46,6 +54,22 @@ type Fetcher interface {
 	Fetch(ctx context.Context) ([]Record, error)
 	// Commit records progress. It is what makes lag fall.
 	Commit(ctx context.Context) error
+	// Rewind moves the consume cursor back to each given record, so those
+	// records and everything after them in their partitions are delivered
+	// again. It takes no context and returns no error because the underlying
+	// seek is a local re-assignment rather than a broker call.
+	Rewind(to []Record)
+}
+
+// Faulter decides whether a batch's commit is replaced by a rewind.
+//
+// It is an interface here, rather than internal/fault imported directly, for
+// the reason every other seam in this package exists: the loop's behaviour
+// under a fault is worth testing, and a test that had to compute sha256 digests
+// to find a key that faults would be testing the injector rather than the loop.
+type Faulter interface {
+	// Targets returns the records to rewind to, or nil to commit normally.
+	Targets(recs []Record) []Record
 }
 
 // ConsumeLoop is the throttle-and-drain half of the demo.
@@ -85,10 +109,14 @@ func ConsumeLoop(
 	sleeper Sleeper,
 	f Fetcher,
 	applier RecordApplier,
+	faulter Faulter,
 	onError func(error),
 ) error {
 	if applier == nil {
 		applier = nopApplier{}
+	}
+	if faulter == nil {
+		faulter = nopFaulter{}
 	}
 	if onError == nil {
 		onError = func(error) {}
@@ -130,6 +158,37 @@ func ConsumeLoop(
 			continue
 		}
 
+		// ── THE FAULT WINDOW ────────────────────────────────────────────
+		//
+		// This is the ONLY point in the loop where a rewind may happen, and
+		// its position is the contract. Every record of the batch has been
+		// applied by now, and no commit has been issued yet, so a rewind here
+		// leaves exactly the state a crash between apply and commit leaves:
+		// the effect ran, the offset did not move.
+		//
+		// It is outside the poll and it is not concurrent with a commit —
+		// franz-go's SetOffsets documentation asks for both, warning that it
+		// is "strongly recommended to use this function outside of the context
+		// of a PollFetches loop ... and to not use this concurrent with
+		// committing". Fetch, apply, this, and Commit are four sequential
+		// steps of one goroutine, so neither can overlap.
+		//
+		// A rewind REPLACES the commit rather than preceding it. Committing
+		// and then rewinding would move the group's offset past records the
+		// loop is about to process again, so a restart mid-experiment would
+		// skip them entirely — the opposite failure to the one being modelled.
+		if targets := faulter.Targets(recs); len(targets) > 0 {
+			for _, t := range targets {
+				log.Info("fault injected: rewinding instead of committing",
+					"key", t.DedupeKey,
+					"partition", t.Partition,
+					"offset", t.Offset,
+					"epoch", t.LeaderEpoch)
+			}
+			f.Rewind(targets)
+			continue
+		}
+
 		if err := f.Commit(ctx); err != nil {
 			if isContextError(err) {
 				return err
@@ -139,6 +198,12 @@ func ConsumeLoop(
 		}
 	}
 }
+
+// nopFaulter never faults, which is the lab's ordinary behaviour.
+type nopFaulter struct{}
+
+// Targets always returns nil.
+func (nopFaulter) Targets([]Record) []Record { return nil }
 
 // nopApplier lets a caller run the loop for its throttling behaviour alone,
 // without a nil check on the hot path.

@@ -2,22 +2,39 @@
   "uid": "kafka-lab-main",
   "title": "kafka-lab",
   "description": "Throttle the consumer below the producer and lag climbs. Open it back up and lag drains. The top panel tells that whole story on its own; everything below it is supporting detail.",
-  "tags": ["kafka-lab"],
+  "tags": [
+    "kafka-lab"
+  ],
   "timezone": "browser",
   "editable": true,
   "schemaVersion": 39,
   "refresh": "5s",
-  "time": { "from": "now-15m", "to": "now" },
-  "templating": { "list": [] },
-  "annotations": { "list": [] },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
   "panels": [
     {
       "id": 1,
       "type": "timeseries",
       "title": "The whole story: produce rate, consume rate, and lag",
-      "description": "Produced and consumed are MEASUREMENTS in messages per second, on the left axis. Lag is a MEASUREMENT in messages, on the right axis — a different unit, which is why it has its own axis rather than being squashed onto a scale it does not share. When the green line drops below the blue one, the orange line climbs. That gap is backpressure.",
-      "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 0 },
+      "description": "Produced and consumed are MEASUREMENTS in messages per second, on the left axis. Lag is a MEASUREMENT in messages, on the right axis \u2014 a different unit, which is why it has its own axis rather than being squashed onto a scale it does not share. When the green line drops below the blue one, the orange line climbs. That gap is backpressure.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kafka-lab-prometheus"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
@@ -34,50 +51,111 @@
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "produced /sec (measured)" },
+            "matcher": {
+              "id": "byName",
+              "options": "produced /sec (measured)"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#58a6ff" } }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#58a6ff"
+                }
+              }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "consumed /sec (measured)" },
+            "matcher": {
+              "id": "byName",
+              "options": "consumed /sec (measured)"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#3fb950" } }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3fb950"
+                }
+              }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "consumer group lag (messages)" },
+            "matcher": {
+              "id": "byName",
+              "options": "consumer group lag (messages)"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#f0883e" } },
-              { "id": "unit", "value": "short" },
-              { "id": "custom.axisPlacement", "value": "right" },
-              { "id": "custom.axisLabel", "value": "messages behind" },
-              { "id": "custom.fillOpacity", "value": 18 },
-              { "id": "custom.lineWidth", "value": 3 }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f0883e"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "messages behind"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 18
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 3
+              }
             ]
           }
         ]
       },
       "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
-        "tooltip": { "mode": "multi", "sort": "none" }
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
       },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
           "expr": "sum(rate(kafka_lab_produced_total[30s]))",
           "legendFormat": "produced /sec (measured)"
         },
         {
           "refId": "B",
-          "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
           "expr": "sum(rate(kafka_lab_consumed_total[30s]))",
           "legendFormat": "consumed /sec (measured)"
         },
         {
           "refId": "C",
-          "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
           "expr": "sum(kafka_lab_consumer_group_lag)",
           "legendFormat": "consumer group lag (messages)"
         }
@@ -86,10 +164,18 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "What was ASKED for — settings, not measurements",
+      "title": "What was ASKED for \u2014 settings, not measurements",
       "description": "These are the slider positions, published on the control topic and applied by the services. They are deliberately on their own panel: a consumer asked for 200/s that spends 20ms of simulated work per message achieves 50/s, so plotting a request beside an achievement without saying which is which teaches the reader something false. Compare this panel with the one above; where they disagree, the difference is the work delay and the broker.",
-      "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kafka-lab-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
@@ -97,7 +183,13 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 2,
-            "lineStyle": { "fill": "dash", "dash": [8, 6] },
+            "lineStyle": {
+              "fill": "dash",
+              "dash": [
+                8,
+                6
+              ]
+            },
             "fillOpacity": 0,
             "showPoints": "never",
             "spanNulls": true,
@@ -106,33 +198,63 @@
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "producer rate asked for" },
+            "matcher": {
+              "id": "byName",
+              "options": "producer rate asked for"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#58a6ff" } }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#58a6ff"
+                }
+              }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "consumer rate asked for" },
+            "matcher": {
+              "id": "byName",
+              "options": "consumer rate asked for"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#3fb950" } }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3fb950"
+                }
+              }
             ]
           }
         ]
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "none" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
       },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
           "expr": "kafka_lab_rate_limit_per_second{service=\"producer\"}",
           "legendFormat": "producer rate asked for"
         },
         {
           "refId": "B",
-          "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
           "expr": "kafka_lab_rate_limit_per_second{service=\"consumer\"}",
           "legendFormat": "consumer rate asked for"
         }
@@ -141,10 +263,18 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Consumer simulated work per message — a setting",
+      "title": "Consumer simulated work per message \u2014 a setting",
       "description": "The second reason achieved and requested differ. One consumer goroutine cannot exceed one message per work-delay however fast it is asked to go: at 20ms of work, 50/s is the ceiling no matter where the rate slider sits.",
-      "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kafka-lab-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "ms",
@@ -152,24 +282,42 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 2,
-            "lineStyle": { "fill": "dash", "dash": [8, 6] },
+            "lineStyle": {
+              "fill": "dash",
+              "dash": [
+                8,
+                6
+              ]
+            },
             "fillOpacity": 0,
             "showPoints": "never",
             "spanNulls": true,
             "axisLabel": "milliseconds per message"
           },
-          "color": { "mode": "fixed", "fixedColor": "#d29922" }
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#d29922"
+          }
         },
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "single", "sort": "none" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
       },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
           "expr": "kafka_lab_work_milliseconds{service=\"consumer\"}",
           "legendFormat": "work asked for"
         }
@@ -180,8 +328,16 @@
       "type": "timeseries",
       "title": "Control records applied, and hot-path errors",
       "description": "How to tell 'the slider did nothing' from 'the slider's message never arrived'. Every settings record a service reads from the control topic bumps its applied counter; if you drag a slider and no line steps here, the record did not reach that service.",
-      "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
-      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 20 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kafka-lab-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -198,21 +354,118 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] },
-        "tooltip": { "mode": "multi", "sort": "none" }
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
       },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
           "expr": "kafka_lab_control_applied_total",
-          "legendFormat": "{{service}} — control records applied"
+          "legendFormat": "{{service}} \u2014 control records applied"
         },
         {
           "refId": "B",
-          "datasource": { "type": "prometheus", "uid": "kafka-lab-prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
           "expr": "kafka_lab_errors_total",
-          "legendFormat": "{{service}} — errors"
+          "legendFormat": "{{service}} \u2014 errors"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Delivery semantics: the defect, the fix, and what the store forgot",
+      "description": "Kafka gives AT-LEAST-ONCE, so a record can arrive twice. These four lines are the whole story of what that costs and whether the idempotency store is covering it.\n\nDOUBLE APPLIED is the defect: a record whose effect ran for a key the effect had already run for. On the at-least-once arm (KL_DEDUPE=false) it climbs whenever a fault is injected. On the dedupe arm it should stay flat at zero.\n\nSUPPRESSED is the fix doing its job: a redelivery the store recognised, whose effect did not run. It is zero unless dedupe is on, and the two arms trade places on these first two lines.\n\nEVICTIONS and EXPIRIES are the honesty lines, and they are why the other two can be believed. The store is BOUNDED: it drops keys to stay under capacity and drops them for age. A dropped key reads as first-seen when its redelivery arrives, the effect runs again, and nothing looks wrong. So a non-zero double-apply count on the dedupe arm means one of two opposite things \u2014 a broken store, or a store that was simply too small \u2014 and only these lines tell you which. A measured duplicate figure taken from a run where either is non-zero is measuring the store, not the delivery semantics.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kafka-lab-prometheus"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisLabel": "records"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
+          "expr": "kafka_lab_double_applied_total",
+          "legendFormat": "double applied \u2014 the defect"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
+          "expr": "kafka_lab_duplicates_suppressed_total",
+          "legendFormat": "suppressed \u2014 the fix"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
+          "expr": "kafka_lab_dedupe_evictions_total",
+          "legendFormat": "evictions ({{store}}) \u2014 guarantee lost to capacity"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kafka-lab-prometheus"
+          },
+          "expr": "kafka_lab_dedupe_expiries_total",
+          "legendFormat": "expiries ({{store}}) \u2014 guarantee lost to age"
         }
       ]
     }

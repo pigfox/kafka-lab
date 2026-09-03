@@ -27,6 +27,7 @@ type fakeFetcher struct {
 	fetches  atomic.Int64
 	commits  atomic.Int64
 	commitEr error
+	rewinds  [][]Record
 }
 
 func (f *fakeFetcher) Fetch(ctx context.Context) ([]Record, error) {
@@ -70,6 +71,64 @@ func synth(b, n int) []Record {
 func (f *fakeFetcher) Commit(context.Context) error {
 	f.commits.Add(1)
 	return f.commitEr
+}
+
+func (f *fakeFetcher) Rewind(to []Record) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rewinds = append(f.rewinds, append([]Record(nil), to...))
+}
+
+func (f *fakeFetcher) rewindsSnapshot() [][]Record {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]Record(nil), f.rewinds...)
+}
+
+// fixedFaulter faults on a named set of keys, so a loop test can drive the
+// fault window without computing a sha256 digest to find a key that qualifies.
+// What internal/fault decides is that package's business; what the loop does
+// once it has decided is this one's.
+type fixedFaulter struct {
+	mu      sync.Mutex
+	keys    map[string]bool
+	fired   map[string]bool
+	batches atomic.Int64
+}
+
+func faultOn(keys ...string) *fixedFaulter {
+	f := &fixedFaulter{keys: map[string]bool{}, fired: map[string]bool{}}
+	for _, k := range keys {
+		f.keys[k] = true
+	}
+	return f
+}
+
+// Targets mirrors the real injector: earliest faulting record per partition,
+// and once per key.
+func (f *fixedFaulter) Targets(recs []Record) []Record {
+	f.batches.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	targets := map[int32]Record{}
+	for _, r := range recs {
+		if !f.keys[r.DedupeKey] || f.fired[r.DedupeKey] {
+			continue
+		}
+		f.fired[r.DedupeKey] = true
+		if prior, ok := targets[r.Partition]; !ok || r.Offset < prior.Offset {
+			targets[r.Partition] = r
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	out := make([]Record, 0, len(targets))
+	for _, r := range targets {
+		out = append(out, r)
+	}
+	return out
 }
 
 // recordSink keeps every record it was handed, in order.
@@ -127,7 +186,7 @@ func TestConsumeLoopProcessesEveryRecordInABatch(t *testing.T) {
 	defer cancel()
 
 	err := ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
-		&countingSleeper{}, f, a, nil)
+		&countingSleeper{}, f, a, nil, nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v", err)
 	}
@@ -154,7 +213,7 @@ func TestConsumeLoopPassesEachRecordThroughIntact(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
-		&countingSleeper{}, f, a, nil)
+		&countingSleeper{}, f, a, nil, nil)
 
 	got := a.snapshotRecords()
 	if len(got) != len(want) {
@@ -177,7 +236,7 @@ func TestConsumeLoopDoesNotSynthesiseAMissingDedupeKey(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
-		&countingSleeper{}, f, a, nil)
+		&countingSleeper{}, f, a, nil, nil)
 
 	got := a.snapshotRecords()
 	if len(got) != 1 {
@@ -201,7 +260,7 @@ func TestConsumeLoopThrottlesPerRecordNotPerBatch(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_ = ConsumeLoop(ctx, quiet(), lim, workAt(0), &countingSleeper{}, f, a, nil)
+	_ = ConsumeLoop(ctx, quiet(), lim, workAt(0), &countingSleeper{}, f, a, nil, nil)
 	elapsed := time.Since(start)
 
 	// Four records at 20/s is three inter-record gaps: ~150ms. A per-batch
@@ -230,7 +289,7 @@ func TestConsumeLoopReadsTheWorkDelayPerRecord(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), work, sleeper, f, nil, nil)
+	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), work, sleeper, f, nil, nil, nil)
 
 	delays := sleeper.snapshot()
 	if len(delays) < 3 {
@@ -250,7 +309,7 @@ func TestConsumeLoopSkipsSleepingWhenWorkIsZero(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0), sleeper, f, nil, nil)
+	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0), sleeper, f, nil, nil, nil)
 
 	if got := len(sleeper.snapshot()); got != 0 {
 		t.Fatalf("work of 0 must not call the sleeper; it was called %d times", got)
@@ -265,7 +324,7 @@ func TestConsumeLoopSurvivesFetchFailures(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
-		&countingSleeper{}, f, a, func(error) { reported.Add(1) })
+		&countingSleeper{}, f, a, nil, func(error) { reported.Add(1) })
 
 	if reported.Load() != 1 {
 		t.Fatalf("reported %d fetch errors, want 1", reported.Load())
@@ -282,7 +341,7 @@ func TestConsumeLoopSurvivesCommitFailures(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
-		&countingSleeper{}, f, nil, func(error) { reported.Add(1) })
+		&countingSleeper{}, f, nil, nil, func(error) { reported.Add(1) })
 
 	if reported.Load() < 2 {
 		t.Fatalf("reported %d commit errors; the loop stopped early", reported.Load())
@@ -292,7 +351,7 @@ func TestConsumeLoopSurvivesCommitFailures(t *testing.T) {
 func TestConsumeLoopStopsOnAContextErrorFromFetch(t *testing.T) {
 	f := &fakeFetcher{batches: []int{0}, fetchErr: []error{context.Canceled}}
 	err := ConsumeLoop(context.Background(), quiet(), ratelimit.New(control.MaxRatePerSec),
-		workAt(0), &countingSleeper{}, f, nil, nil)
+		workAt(0), &countingSleeper{}, f, nil, nil, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
 	}
@@ -301,7 +360,7 @@ func TestConsumeLoopStopsOnAContextErrorFromFetch(t *testing.T) {
 func TestConsumeLoopStopsOnAContextErrorFromCommit(t *testing.T) {
 	f := &fakeFetcher{batches: []int{1}, commitEr: context.Canceled}
 	err := ConsumeLoop(context.Background(), quiet(), ratelimit.New(control.MaxRatePerSec),
-		workAt(0), &countingSleeper{}, f, nil, nil)
+		workAt(0), &countingSleeper{}, f, nil, nil, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
 	}
@@ -310,7 +369,7 @@ func TestConsumeLoopStopsOnAContextErrorFromCommit(t *testing.T) {
 func TestConsumeLoopStopsWhenTheSleeperIsInterrupted(t *testing.T) {
 	f := &fakeFetcher{batches: []int{5}}
 	err := ConsumeLoop(context.Background(), quiet(), ratelimit.New(control.MaxRatePerSec),
-		workAt(10), &countingSleeper{err: context.Canceled}, f, nil, nil)
+		workAt(10), &countingSleeper{err: context.Canceled}, f, nil, nil, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
 	}
@@ -324,7 +383,7 @@ func TestConsumeLoopNoticesShutdownWhileIdle(t *testing.T) {
 	cancel()
 
 	err := ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec),
-		workAt(0), &countingSleeper{}, f, nil, nil)
+		workAt(0), &countingSleeper{}, f, nil, nil, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
 	}
@@ -340,7 +399,7 @@ func TestConsumeLoopStopsPromptlyOnCancellation(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec),
-			workAt(0), &countingSleeper{}, f, nil, nil)
+			workAt(0), &countingSleeper{}, f, nil, nil, nil)
 	}()
 
 	time.Sleep(20 * time.Millisecond)
@@ -360,7 +419,7 @@ func TestConsumeLoopToleratesNilCallbacks(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec),
-		workAt(0), &countingSleeper{}, f, nil, nil)
+		workAt(0), &countingSleeper{}, f, nil, nil, nil)
 }
 
 func TestNopApplierApplies(t *testing.T) {
@@ -395,12 +454,181 @@ func TestConsumeLoopContinuesAfterAnEmptyFetch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
-		&countingSleeper{}, f, a, nil)
+		&countingSleeper{}, f, a, nil, nil)
 
 	if a.n.Load() != 3 {
 		t.Fatalf("applied %d; an empty fetch stopped the loop", a.n.Load())
 	}
 	if f.commits.Load() != 1 {
 		t.Fatalf("commits: got %d want 1 — the empty batch must not commit", f.commits.Load())
+	}
+}
+
+// ── the fault window ───────────────────────────────────────────────────────
+
+// A REWIND REPLACES THE COMMIT. Committing and then rewinding would move the
+// group's offset past records the loop is about to reprocess, so a restart
+// mid-experiment would skip them — the opposite failure to the one being
+// modelled.
+func TestAFaultRewindsInsteadOfCommitting(t *testing.T) {
+	batch := []Record{
+		{DedupeKey: "k1", Topic: "events", Partition: 0, Offset: 10, LeaderEpoch: 4},
+		{DedupeKey: "k2", Topic: "events", Partition: 0, Offset: 11, LeaderEpoch: 4},
+	}
+	f := &fakeFetcher{records: [][]Record{batch}}
+	a := &recordSink{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
+		&countingSleeper{}, f, a, faultOn("k1"), nil)
+
+	if f.commits.Load() != 0 {
+		t.Fatalf("the faulted batch committed %d times; a rewind must replace the commit", f.commits.Load())
+	}
+	rewinds := f.rewindsSnapshot()
+	if len(rewinds) != 1 {
+		t.Fatalf("got %d rewinds, want 1", len(rewinds))
+	}
+	if len(rewinds[0]) != 1 || rewinds[0][0].DedupeKey != "k1" {
+		t.Fatalf("rewound to %+v, want the record keyed k1", rewinds[0])
+	}
+}
+
+// EVERY RECORD OF THE BATCH IS APPLIED BEFORE THE REWIND. That ordering is the
+// whole point: the duplicate that matters is the one whose effect already ran.
+// A rewind that fired before the batch finished applying would model a lost
+// message rather than a repeated one.
+func TestEveryRecordIsAppliedBeforeAFaultRewinds(t *testing.T) {
+	batch := []Record{
+		{DedupeKey: "k1", Partition: 0, Offset: 10},
+		{DedupeKey: "k2", Partition: 0, Offset: 11},
+		{DedupeKey: "k3", Partition: 0, Offset: 12},
+	}
+	f := &fakeFetcher{records: [][]Record{batch}}
+	a := &recordSink{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
+		&countingSleeper{}, f, a, faultOn("k1"), nil)
+
+	if got := a.n.Load(); got != 3 {
+		t.Fatalf("applied %d of 3 before the rewind", got)
+	}
+}
+
+// THE REWIND TARGET CARRIES THE EPOCH. Defaulting it to -1 waives the broker's
+// truncation check, which turns data loss into a silent resume at the wrong
+// place.
+func TestARewindTargetCarriesTopicOffsetAndEpoch(t *testing.T) {
+	batch := []Record{{DedupeKey: "k1", Topic: "events", Partition: 2, Offset: 77, LeaderEpoch: 9}}
+	f := &fakeFetcher{records: [][]Record{batch}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
+		&countingSleeper{}, f, nil, faultOn("k1"), nil)
+
+	rewinds := f.rewindsSnapshot()
+	if len(rewinds) != 1 || len(rewinds[0]) != 1 {
+		t.Fatalf("got rewinds %+v", rewinds)
+	}
+	got := rewinds[0][0]
+	if got.Topic != "events" || got.Partition != 2 || got.Offset != 77 || got.LeaderEpoch != 9 {
+		t.Fatalf("rewind target %+v lost part of its address", got)
+	}
+}
+
+// A batch that faults nothing commits exactly as before. The fault path must be
+// invisible when the rate is zero, which is the lab's default.
+func TestABatchThatFaultsNothingCommitsNormally(t *testing.T) {
+	f := &fakeFetcher{batches: []int{3}}
+	a := &recordSink{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
+		&countingSleeper{}, f, a, faultOn("nothing-matches-this"), nil)
+
+	if f.commits.Load() != 1 {
+		t.Fatalf("committed %d times, want 1", f.commits.Load())
+	}
+	if len(f.rewindsSnapshot()) != 0 {
+		t.Fatal("a batch with no fault rewound")
+	}
+}
+
+// A nil Faulter is the ordinary lab: no rewinds, commits as before.
+func TestANilFaulterNeverRewinds(t *testing.T) {
+	f := &fakeFetcher{batches: []int{2, 2}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
+		&countingSleeper{}, f, nil, nil, nil)
+
+	if len(f.rewindsSnapshot()) != 0 {
+		t.Fatal("a nil faulter rewound")
+	}
+	if f.commits.Load() != 2 {
+		t.Fatalf("committed %d times, want 2", f.commits.Load())
+	}
+}
+
+func TestNopFaulterTargetsNothing(t *testing.T) {
+	if got := (nopFaulter{}).Targets([]Record{{DedupeKey: "a"}}); got != nil {
+		t.Fatalf("got %+v, want nil", got)
+	}
+}
+
+// AN EMPTY BATCH NEVER REACHES THE FAULT WINDOW. It has no records to apply, so
+// there is nothing whose effect could have run before the rewind — and a rewind
+// on an idle poll would move the cursor for no reason.
+func TestAnEmptyBatchIsNotOfferedToTheFaulter(t *testing.T) {
+	f := &fakeFetcher{batches: []int{0, 0, 1}}
+	faulter := faultOn("b2-r0")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
+		&countingSleeper{}, f, nil, faulter, nil)
+
+	if got := faulter.batches.Load(); got != 1 {
+		t.Fatalf("the faulter saw %d batches; the two empty polls must not reach it", got)
+	}
+}
+
+// ONE REWIND PER PARTITION, at the EARLIEST faulting offset. A rewind to a later
+// offset would leave an earlier faulted record committed, so a fault would be
+// logged whose redelivery never arrives.
+func TestARewindCoversEachPartitionAtItsEarliestFault(t *testing.T) {
+	batch := []Record{
+		{DedupeKey: "p0-late", Topic: "events", Partition: 0, Offset: 30},
+		{DedupeKey: "p0-early", Topic: "events", Partition: 0, Offset: 10},
+		{DedupeKey: "p1-only", Topic: "events", Partition: 1, Offset: 20},
+	}
+	f := &fakeFetcher{records: [][]Record{batch}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = ConsumeLoop(ctx, quiet(), ratelimit.New(control.MaxRatePerSec), workAt(0),
+		&countingSleeper{}, f, nil, faultOn("p0-late", "p0-early", "p1-only"), nil)
+
+	rewinds := f.rewindsSnapshot()
+	if len(rewinds) != 1 {
+		t.Fatalf("got %d rewinds, want 1", len(rewinds))
+	}
+	byPartition := map[int32]Record{}
+	for _, r := range rewinds[0] {
+		byPartition[r.Partition] = r
+	}
+	if len(byPartition) != 2 {
+		t.Fatalf("rewound %d partitions, want 2", len(byPartition))
+	}
+	if got := byPartition[0].Offset; got != 10 {
+		t.Fatalf("partition 0 rewound to offset %d, want the earliest fault at 10", got)
+	}
+	if got := byPartition[1].Offset; got != 20 {
+		t.Fatalf("partition 1 rewound to offset %d, want 20", got)
 	}
 }

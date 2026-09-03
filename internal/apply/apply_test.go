@@ -18,10 +18,10 @@ type countingObserver struct {
 	applied, suppressed, double, noKey atomic.Int64
 }
 
-func (o *countingObserver) Applied()       { o.applied.Add(1) }
-func (o *countingObserver) Suppressed()    { o.suppressed.Add(1) }
-func (o *countingObserver) DoubleApplied() { o.double.Add(1) }
-func (o *countingObserver) NoKey()         { o.noKey.Add(1) }
+func (o *countingObserver) Applied(runner.Record)       { o.applied.Add(1) }
+func (o *countingObserver) Suppressed(runner.Record)    { o.suppressed.Add(1) }
+func (o *countingObserver) DoubleApplied(runner.Record) { o.double.Add(1) }
+func (o *countingObserver) NoKey(runner.Record)         { o.noKey.Add(1) }
 
 type effectLog struct {
 	mu   sync.Mutex
@@ -55,7 +55,7 @@ func freeze() frozenClock {
 }
 
 func stores(capacity int) (*idem.Set, *idem.Set) {
-	return idem.New(capacity, time.Minute, freeze()), idem.New(capacity, time.Minute, freeze())
+	return idem.New(capacity, time.Minute, freeze(), nil), idem.New(capacity, time.Minute, freeze(), nil)
 }
 
 // ── THE AT-LEAST-ONCE ARM: dedupe OFF ──────────────────────────────────────
@@ -263,8 +263,8 @@ func TestKeylessRecordsAreNeverJudgedDuplicates(t *testing.T) {
 // The dedupe guarantee is lost for an evicted key, and the loss is visible in
 // the store's eviction count rather than only in the doc comment.
 func TestAnEvictedKeyIsAppliedAgainOnTheDedupeArm(t *testing.T) {
-	seen := idem.New(2, time.Minute, freeze())
-	applied := idem.New(64, time.Minute, freeze())
+	seen := idem.New(2, time.Minute, freeze(), nil)
+	applied := idem.New(64, time.Minute, freeze(), nil)
 	a := New(Options{Dedupe: true, Seen: seen, AppliedKeys: applied})
 
 	a.Apply(rec("victim"))
@@ -287,8 +287,8 @@ func TestAnEvictedKeyIsAppliedAgainOnTheDedupeArm(t *testing.T) {
 // The double-apply count is a LOWER BOUND: a key evicted from the apply tally
 // stops being recognisable as a repeat.
 func TestTheDoubleApplyCountIsALowerBound(t *testing.T) {
-	seen := idem.New(64, time.Minute, freeze())
-	applied := idem.New(2, time.Minute, freeze())
+	seen := idem.New(64, time.Minute, freeze(), nil)
+	applied := idem.New(2, time.Minute, freeze(), nil)
 	a := New(Options{Dedupe: false, Seen: seen, AppliedKeys: applied})
 
 	a.Apply(rec("victim"))
@@ -386,10 +386,92 @@ func TestTheDefaultTTLMatchesTheTopicRetention(t *testing.T) {
 
 func TestNopObserverAbsorbsEveryOutcome(t *testing.T) {
 	var o Observer = nopObserver{}
-	o.Applied()
-	o.Suppressed()
-	o.DoubleApplied()
-	o.NoKey()
+	o.Applied(runner.Record{})
+	o.Suppressed(runner.Record{})
+	o.DoubleApplied(runner.Record{})
+	o.NoKey(runner.Record{})
+}
+
+// ── the observer receives the RECORD, which is what makes the log possible ──
+//
+// A duplicate count with no way to name the duplicates is a number nobody can
+// check. Suppressed and DoubleApplied are the two ways a redelivery shows up,
+// and both must hand back the record they were told about, unaltered.
+type recordingObserver struct {
+	mu                                 sync.Mutex
+	applied, suppressed, double, noKey []runner.Record
+}
+
+func (o *recordingObserver) Applied(r runner.Record) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.applied = append(o.applied, r)
+}
+
+func (o *recordingObserver) Suppressed(r runner.Record) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.suppressed = append(o.suppressed, r)
+}
+
+func (o *recordingObserver) DoubleApplied(r runner.Record) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.double = append(o.double, r)
+}
+
+func (o *recordingObserver) NoKey(r runner.Record) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.noKey = append(o.noKey, r)
+}
+
+func TestASuppressedRedeliveryIsHandedBackWhole(t *testing.T) {
+	obs := &recordingObserver{}
+	a := New(Options{Dedupe: true, Observer: obs})
+
+	first := runner.Record{DedupeKey: "run:7", Topic: "events", Partition: 2, Offset: 40, LeaderEpoch: 5}
+	again := runner.Record{DedupeKey: "run:7", Topic: "events", Partition: 2, Offset: 40, LeaderEpoch: 5}
+	a.Apply(first)
+	a.Apply(again)
+
+	if len(obs.suppressed) != 1 {
+		t.Fatalf("got %d suppressed records, want 1", len(obs.suppressed))
+	}
+	if obs.suppressed[0] != again {
+		t.Fatalf("got %+v want %+v", obs.suppressed[0], again)
+	}
+}
+
+func TestADoubleAppliedRedeliveryIsHandedBackWhole(t *testing.T) {
+	obs := &recordingObserver{}
+	a := New(Options{Dedupe: false, Observer: obs})
+
+	r := runner.Record{DedupeKey: "run:7", Topic: "events", Partition: 1, Offset: 12, LeaderEpoch: 3}
+	a.Apply(r)
+	a.Apply(r)
+
+	if len(obs.double) != 1 {
+		t.Fatalf("got %d double-applied records, want 1", len(obs.double))
+	}
+	if obs.double[0] != r {
+		t.Fatalf("got %+v want %+v", obs.double[0], r)
+	}
+	if len(obs.applied) != 2 {
+		t.Fatalf("got %d applied records, want 2", len(obs.applied))
+	}
+}
+
+func TestAKeylessRecordIsHandedBackWhole(t *testing.T) {
+	obs := &recordingObserver{}
+	a := New(Options{Dedupe: true, Observer: obs})
+
+	r := runner.Record{Topic: "events", Partition: 0, Offset: 3, LeaderEpoch: 1}
+	a.Apply(r)
+
+	if len(obs.noKey) != 1 || obs.noKey[0] != r {
+		t.Fatalf("got %+v", obs.noKey)
+	}
 }
 
 // The Applier must satisfy the interface the consume loop takes; a signature

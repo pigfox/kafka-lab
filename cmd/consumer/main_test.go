@@ -15,6 +15,7 @@ import (
 	"github.com/pigfox/kafka-lab/internal/apply"
 	"github.com/pigfox/kafka-lab/internal/control"
 	"github.com/pigfox/kafka-lab/internal/event"
+	"github.com/pigfox/kafka-lab/internal/idem"
 	"github.com/pigfox/kafka-lab/internal/metrics"
 	"github.com/pigfox/kafka-lab/internal/ratelimit"
 	"github.com/pigfox/kafka-lab/internal/runner"
@@ -248,7 +249,7 @@ func TestConsumedTotalCountsEveryRecordOnBothArms(t *testing.T) {
 
 	for _, dedupe := range []bool{false, true} {
 		m := metrics.New(metrics.RoleConsumer)
-		d := drainCounter{m: m, inner: apply.New(apply.Options{Dedupe: dedupe, Observer: observer{m: m}})}
+		d := drainCounter{m: m, inner: apply.New(apply.Options{Dedupe: dedupe, Observer: observer{m: m, log: quiet()}})}
 		for _, r := range input {
 			d.Apply(r)
 		}
@@ -272,7 +273,7 @@ func TestTheObserverPublishesBothArmsToDistinctSeries(t *testing.T) {
 	got := map[bool]arm{}
 	for _, dedupe := range []bool{false, true} {
 		m := metrics.New(metrics.RoleConsumer)
-		d := drainCounter{m: m, inner: apply.New(apply.Options{Dedupe: dedupe, Observer: observer{m: m}})}
+		d := drainCounter{m: m, inner: apply.New(apply.Options{Dedupe: dedupe, Observer: observer{m: m, log: quiet()}})}
 		for _, r := range input {
 			d.Apply(r)
 		}
@@ -374,5 +375,195 @@ func counterValue(t *testing.T, m *metrics.Set, name string) float64 {
 		}
 	}
 	t.Fatalf("counter %s not found", name)
+	return 0
+}
+
+// ── the rewind ─────────────────────────────────────────────────────────────
+
+// THE EPOCH TRAVELS WITH THE RECORD. franz-go documents LeaderEpoch as what
+// clients use for data-loss detection: seeking with the real epoch lets the
+// broker say the log has been truncated beneath us, while -1 waives the check
+// and resumes at whatever now sits at that offset.
+func TestToRunnerRecordsCarriesTheTopicAndLeaderEpoch(t *testing.T) {
+	in := []*kgo.Record{{
+		Topic: "events", Partition: 2, Offset: 77, LeaderEpoch: 9,
+		Headers: []kgo.RecordHeader{{Key: event.DedupeHeader, Value: []byte("n:1")}},
+	}}
+
+	got := toRunnerRecords(in)
+	want := runner.Record{DedupeKey: "n:1", Topic: "events", Partition: 2, Offset: 77, LeaderEpoch: 9}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("got %+v want %+v", got, want)
+	}
+}
+
+// setOffsetsRecorder captures what a rewind would hand franz-go, so the
+// translation is assertable without a broker.
+type setOffsetsRecorder struct {
+	calls []map[string]map[int32]kgo.EpochOffset
+}
+
+func (s *setOffsetsRecorder) SetOffsets(o map[string]map[int32]kgo.EpochOffset) {
+	s.calls = append(s.calls, o)
+}
+
+func TestRewindSeeksEachPartitionToItsRecordsOffsetAndEpoch(t *testing.T) {
+	rec := &setOffsetsRecorder{}
+	f := &fetcher{seeker: rec}
+
+	f.Rewind([]runner.Record{
+		{Topic: "events", Partition: 0, Offset: 10, LeaderEpoch: 4},
+		{Topic: "events", Partition: 2, Offset: 20, LeaderEpoch: 5},
+	})
+
+	if len(rec.calls) != 1 {
+		t.Fatalf("SetOffsets called %d times, want 1", len(rec.calls))
+	}
+	byPartition, ok := rec.calls[0]["events"]
+	if !ok {
+		t.Fatalf("no offsets set for the events topic: %+v", rec.calls[0])
+	}
+	if len(byPartition) != 2 {
+		t.Fatalf("set %d partitions, want 2", len(byPartition))
+	}
+	if got := byPartition[0]; got.Offset != 10 || got.Epoch != 4 {
+		t.Fatalf("partition 0 sought to %+v, want offset 10 epoch 4", got)
+	}
+	if got := byPartition[2]; got.Offset != 20 || got.Epoch != 5 {
+		t.Fatalf("partition 2 sought to %+v, want offset 20 epoch 5", got)
+	}
+}
+
+// A REWIND MUST NEVER PASS EPOCH -1. That value waives truncation detection, so
+// a seek into a log that has been truncated would silently resume at whatever
+// now occupies the offset instead of reporting data loss.
+func TestRewindNeverWaivesTruncationDetection(t *testing.T) {
+	rec := &setOffsetsRecorder{}
+	f := &fetcher{seeker: rec}
+
+	f.Rewind([]runner.Record{{Topic: "events", Partition: 1, Offset: 5, LeaderEpoch: 3}})
+
+	for topic, byPartition := range rec.calls[0] {
+		for partition, eo := range byPartition {
+			if eo.Epoch == -1 {
+				t.Fatalf("%s/%d was sought with epoch -1", topic, partition)
+			}
+		}
+	}
+}
+
+func TestRewindGroupsTargetsByTopic(t *testing.T) {
+	rec := &setOffsetsRecorder{}
+	f := &fetcher{seeker: rec}
+
+	f.Rewind([]runner.Record{
+		{Topic: "events", Partition: 0, Offset: 1, LeaderEpoch: 1},
+		{Topic: "other", Partition: 0, Offset: 2, LeaderEpoch: 1},
+	})
+
+	if got := len(rec.calls[0]); got != 2 {
+		t.Fatalf("set offsets for %d topics, want 2", got)
+	}
+}
+
+func TestRewindOnAnEmptyTargetListSetsNothing(t *testing.T) {
+	rec := &setOffsetsRecorder{}
+	f := &fetcher{seeker: rec}
+	f.Rewind(nil)
+	if len(rec.calls[0]) != 0 {
+		t.Fatalf("an empty rewind set %+v", rec.calls[0])
+	}
+}
+
+// ── the loss callbacks ─────────────────────────────────────────────────────
+
+// EVERY LOSS IS COUNTED UNDER ITS OWN STORE AND REASON. A double-apply figure
+// taken from a run whose store was overflowing measures the store, not the
+// delivery semantics, so these counters are what decide whether a measured run
+// is publishable at all.
+func TestALossIncrementsTheRightCounterForItsStoreAndReason(t *testing.T) {
+	cases := []struct {
+		store  metrics.Store
+		reason idem.LossReason
+		metric string
+		label  string
+	}{
+		{metrics.StoreSeen, idem.LossCapacity, "kafka_lab_dedupe_evictions_total", "seen"},
+		{metrics.StoreSeen, idem.LossTTL, "kafka_lab_dedupe_expiries_total", "seen"},
+		{metrics.StoreApplied, idem.LossCapacity, "kafka_lab_dedupe_evictions_total", "applied"},
+		{metrics.StoreApplied, idem.LossTTL, "kafka_lab_dedupe_expiries_total", "applied"},
+	}
+	for _, c := range cases {
+		t.Run(string(c.store)+"/"+string(c.reason), func(t *testing.T) {
+			m := metrics.New(metrics.RoleConsumer)
+			lossOf(quiet(), m, c.store)(idem.Loss{Key: "run:1", Reason: c.reason})
+
+			if got := labelledCounter(t, m, c.metric, c.label); got != 1 {
+				t.Fatalf("%s{store=%q} is %v, want 1", c.metric, c.label, got)
+			}
+			// And nothing else moved.
+			other := "kafka_lab_dedupe_expiries_total"
+			if c.metric == other {
+				other = "kafka_lab_dedupe_evictions_total"
+			}
+			if got := labelledCounter(t, m, other, c.label); got != 0 {
+				t.Fatalf("%s{store=%q} also moved, to %v", other, c.label, got)
+			}
+		})
+	}
+}
+
+// The two stores must not be conflated: `seen` decides suppression, `applied`
+// makes a repeat recognisable, and a loss in each has a different consequence.
+func TestALossInOneStoreDoesNotMoveTheOther(t *testing.T) {
+	m := metrics.New(metrics.RoleConsumer)
+	lossOf(quiet(), m, metrics.StoreSeen)(idem.Loss{Key: "run:1", Reason: idem.LossCapacity})
+
+	if got := labelledCounter(t, m, "kafka_lab_dedupe_evictions_total", "seen"); got != 1 {
+		t.Fatalf("seen evictions %v want 1", got)
+	}
+	if got := labelledCounter(t, m, "kafka_lab_dedupe_evictions_total", "applied"); got != 0 {
+		t.Fatalf("applied evictions %v want 0", got)
+	}
+}
+
+// A store wired through lossOf reports its real losses, so the counter and the
+// set agree rather than being two independent tallies.
+func TestAStoreWiredThroughLossOfReportsItsRealEvictions(t *testing.T) {
+	m := metrics.New(metrics.RoleConsumer)
+	s := idem.New(2, time.Minute, nil, lossOf(quiet(), m, metrics.StoreSeen))
+
+	s.Observe("a")
+	s.Observe("b")
+	s.Observe("c") // evicts "a"
+	s.Observe("d") // evicts "b"
+
+	if got := labelledCounter(t, m, "kafka_lab_dedupe_evictions_total", "seen"); got != 2 {
+		t.Fatalf("counter says %v evictions", got)
+	}
+	if s.Evictions() != 2 {
+		t.Fatalf("the set says %d evictions", s.Evictions())
+	}
+}
+
+func labelledCounter(t *testing.T, m *metrics.Set, name, store string) float64 {
+	t.Helper()
+	families, err := m.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, metric := range f.GetMetric() {
+			for _, l := range metric.GetLabel() {
+				if l.GetName() == "store" && l.GetValue() == store {
+					return metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	t.Fatalf("counter %s{store=%q} not found", name, store)
 	return 0
 }

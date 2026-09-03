@@ -33,7 +33,7 @@ func (c *manualClock) advance(d time.Duration) {
 }
 
 func TestFirstSightingReportsZero(t *testing.T) {
-	s := New(8, time.Minute, newClock())
+	s := New(8, time.Minute, newClock(), nil)
 	if got := s.Observe("a"); got != 0 {
 		t.Fatalf("first sighting reported %d prior sightings, want 0", got)
 	}
@@ -45,7 +45,7 @@ func TestFirstSightingReportsZero(t *testing.T) {
 // The returned number is the count BEFORE this call, so a caller can tell a
 // second delivery from a fifth without keeping its own tally.
 func TestRepeatSightingsReportThePriorCount(t *testing.T) {
-	s := New(8, time.Minute, newClock())
+	s := New(8, time.Minute, newClock(), nil)
 	for want := 0; want < 4; want++ {
 		if got := s.Observe("a"); got != want {
 			t.Fatalf("sighting %d reported %d prior, want %d", want+1, got, want)
@@ -60,7 +60,7 @@ func TestRepeatSightingsReportThePriorCount(t *testing.T) {
 // Contains/Add pair would let every goroutine here read absent before any of
 // them recorded, and every one of them would apply.
 func TestConcurrentSightingsOfOneKeyElectExactlyOneFirst(t *testing.T) {
-	s := New(64, time.Minute, newClock())
+	s := New(64, time.Minute, newClock(), nil)
 
 	const goroutines = 64
 	var firsts atomic.Int64
@@ -86,7 +86,7 @@ func TestConcurrentSightingsOfOneKeyElectExactlyOneFirst(t *testing.T) {
 }
 
 func TestConcurrentSightingsOfDistinctKeysAreAllFirst(t *testing.T) {
-	s := New(256, time.Minute, newClock())
+	s := New(256, time.Minute, newClock(), nil)
 
 	var firsts atomic.Int64
 	var wg sync.WaitGroup
@@ -108,7 +108,7 @@ func TestConcurrentSightingsOfDistinctKeysAreAllFirst(t *testing.T) {
 
 func TestAKeyExpiresAfterItsTTL(t *testing.T) {
 	c := newClock()
-	s := New(8, time.Minute, c)
+	s := New(8, time.Minute, c, nil)
 
 	s.Observe("a")
 	c.advance(time.Minute)
@@ -124,7 +124,7 @@ func TestAKeyExpiresAfterItsTTL(t *testing.T) {
 // The boundary is inclusive: a key survives strictly less than the TTL.
 func TestAKeySurvivesUpToButNotIncludingItsDeadline(t *testing.T) {
 	c := newClock()
-	s := New(8, time.Minute, c)
+	s := New(8, time.Minute, c, nil)
 
 	s.Observe("a")
 	c.advance(time.Minute - time.Nanosecond)
@@ -140,7 +140,7 @@ func TestAKeySurvivesUpToButNotIncludingItsDeadline(t *testing.T) {
 // which is only correct because a repeat sighting does NOT refresh the deadline.
 func TestExpirySweepStopsAtTheFirstLiveEntry(t *testing.T) {
 	c := newClock()
-	s := New(8, time.Minute, c)
+	s := New(8, time.Minute, c, nil)
 
 	s.Observe("old")
 	c.advance(30 * time.Second)
@@ -159,7 +159,7 @@ func TestExpirySweepStopsAtTheFirstLiveEntry(t *testing.T) {
 // forever and insertion order would stop matching expiry order.
 func TestARepeatSightingDoesNotRefreshTheDeadline(t *testing.T) {
 	c := newClock()
-	s := New(8, time.Minute, c)
+	s := New(8, time.Minute, c, nil)
 
 	s.Observe("a")
 	c.advance(59 * time.Second)
@@ -173,7 +173,7 @@ func TestARepeatSightingDoesNotRefreshTheDeadline(t *testing.T) {
 
 func TestATTLOfZeroMeansEntriesNeverExpire(t *testing.T) {
 	c := newClock()
-	s := New(8, 0, c)
+	s := New(8, 0, c, nil)
 
 	s.Observe("a")
 	c.advance(100 * 24 * time.Hour)
@@ -187,7 +187,7 @@ func TestATTLOfZeroMeansEntriesNeverExpire(t *testing.T) {
 }
 
 func TestCapacityEvictsTheOldestFirstSighting(t *testing.T) {
-	s := New(3, time.Minute, newClock())
+	s := New(3, time.Minute, newClock(), nil)
 
 	s.Observe("a")
 	s.Observe("b")
@@ -217,7 +217,7 @@ func TestCapacityEvictsTheOldestFirstSighting(t *testing.T) {
 // applies the effect a second time. The test exists so nobody discovers this
 // property by being surprised by it in production.
 func TestAnEvictedKeySlipsThroughAsFirstSeen(t *testing.T) {
-	s := New(2, time.Minute, newClock())
+	s := New(2, time.Minute, newClock(), nil)
 
 	s.Observe("victim")
 	s.Observe("b")
@@ -234,7 +234,7 @@ func TestAnEvictedKeySlipsThroughAsFirstSeen(t *testing.T) {
 // The same slip, on the timer instead of on pressure.
 func TestAnExpiredKeySlipsThroughAsFirstSeen(t *testing.T) {
 	c := newClock()
-	s := New(64, time.Second, c)
+	s := New(64, time.Second, c, nil)
 
 	s.Observe("victim")
 	c.advance(2 * time.Second)
@@ -251,7 +251,7 @@ func TestAnExpiredKeySlipsThroughAsFirstSeen(t *testing.T) {
 // store that silently does not exist.
 func TestACapacityBelowOneIsRaisedToOne(t *testing.T) {
 	for _, capacity := range []int{0, -5} {
-		s := New(capacity, time.Minute, newClock())
+		s := New(capacity, time.Minute, newClock(), nil)
 		if s.Observe("a") != 0 {
 			t.Fatalf("capacity %d: first sighting was not first", capacity)
 		}
@@ -262,7 +262,7 @@ func TestACapacityBelowOneIsRaisedToOne(t *testing.T) {
 }
 
 func TestANilClockReadsTheWallClock(t *testing.T) {
-	s := New(8, time.Minute, nil)
+	s := New(8, time.Minute, nil, nil)
 	if s.Observe("a") != 0 {
 		t.Fatal("first sighting was not first")
 	}
@@ -280,7 +280,7 @@ func TestRealClockReadsTheWallClock(t *testing.T) {
 }
 
 func TestAnEmptySetSweepsNothing(t *testing.T) {
-	s := New(4, time.Minute, newClock())
+	s := New(4, time.Minute, newClock(), nil)
 	if s.Len() != 0 {
 		t.Fatalf("a new set holds %d keys", s.Len())
 	}
@@ -288,4 +288,148 @@ func TestAnEmptySetSweepsNothing(t *testing.T) {
 		t.Fatalf("a new set reports %d evictions and %d expiries", s.Evictions(), s.Expiries())
 	}
 	s.Observe("a")
+}
+
+// ── the loss callback ──────────────────────────────────────────────────────
+//
+// The Evictions and Expiries totals answer "did we lose anything?" after the
+// fact. The callback fires AT THE LOSS and names the key, which is what lets a
+// counter move in real time and a log line say whose guarantee just went.
+
+type lossLog struct {
+	mu     sync.Mutex
+	losses []Loss
+}
+
+func (l *lossLog) record(loss Loss) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.losses = append(l.losses, loss)
+}
+
+func (l *lossLog) snapshot() []Loss {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]Loss(nil), l.losses...)
+}
+
+func TestAnEvictionIsReportedWithItsKeyAndReason(t *testing.T) {
+	log := &lossLog{}
+	s := New(2, time.Minute, newClock(), log.record)
+
+	s.Observe("victim")
+	s.Observe("b")
+	s.Observe("c") // capacity 2, so "victim" goes
+
+	got := log.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("got %d losses, want 1: %+v", len(got), got)
+	}
+	if got[0].Key != "victim" {
+		t.Fatalf("the wrong key was reported: %q", got[0].Key)
+	}
+	if got[0].Reason != LossCapacity {
+		t.Fatalf("reason %q want %q", got[0].Reason, LossCapacity)
+	}
+}
+
+func TestAnExpiryIsReportedWithItsKeyAndReason(t *testing.T) {
+	log := &lossLog{}
+	c := newClock()
+	s := New(64, time.Minute, c, log.record)
+
+	s.Observe("victim")
+	c.advance(2 * time.Minute)
+	s.Observe("other") // the sweep runs on the next Observe
+
+	got := log.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("got %d losses, want 1: %+v", len(got), got)
+	}
+	if got[0].Key != "victim" {
+		t.Fatalf("the wrong key was reported: %q", got[0].Key)
+	}
+	if got[0].Reason != LossTTL {
+		t.Fatalf("reason %q want %q", got[0].Reason, LossTTL)
+	}
+}
+
+// The two reasons must be distinguishable: they call for opposite responses —
+// a capacity loss says the store is too small, an age loss says the window is
+// too short.
+func TestTheTwoLossReasonsAreReportedSeparately(t *testing.T) {
+	log := &lossLog{}
+	c := newClock()
+	s := New(2, time.Minute, c, log.record)
+
+	s.Observe("a")
+	s.Observe("b")
+	s.Observe("c") // evicts "a" for capacity
+	c.advance(2 * time.Minute)
+	s.Observe("d") // expires "b" and "c" for age
+
+	byReason := map[LossReason][]string{}
+	for _, l := range log.snapshot() {
+		byReason[l.Reason] = append(byReason[l.Reason], l.Key)
+	}
+	if got := byReason[LossCapacity]; len(got) != 1 || got[0] != "a" {
+		t.Fatalf("capacity losses %v, want [a]", got)
+	}
+	if got := byReason[LossTTL]; len(got) != 2 {
+		t.Fatalf("ttl losses %v, want two", got)
+	}
+	if s.Evictions() != 1 || s.Expiries() != 2 {
+		t.Fatalf("totals disagree with the callback: %d evictions, %d expiries",
+			s.Evictions(), s.Expiries())
+	}
+}
+
+// A set that loses nothing must report nothing, or a counter driven by this
+// callback would climb on a healthy run.
+func TestNoLossIsReportedWhenNothingIsForgotten(t *testing.T) {
+	log := &lossLog{}
+	s := New(64, time.Minute, newClock(), log.record)
+
+	for i := 0; i < 20; i++ {
+		s.Observe("k" + strconv.Itoa(i))
+		s.Observe("k" + strconv.Itoa(i))
+	}
+
+	if got := log.snapshot(); len(got) != 0 {
+		t.Fatalf("a set within its bounds reported %d losses: %+v", len(got), got)
+	}
+}
+
+func TestANilLossCallbackIsSafe(t *testing.T) {
+	s := New(1, time.Minute, newClock(), nil)
+	s.Observe("a")
+	s.Observe("b") // evicts "a"; must not panic
+	if s.Evictions() != 1 {
+		t.Fatalf("evictions %d want 1", s.Evictions())
+	}
+}
+
+// The callback runs with the set's lock held, so a counter increment must be
+// safe while other goroutines are observing. This would deadlock or race if the
+// callback were invoked outside the lock without care.
+func TestTheLossCallbackIsSafeUnderConcurrentObserves(t *testing.T) {
+	var losses atomic.Int64
+	s := New(4, time.Minute, newClock(), func(Loss) { losses.Add(1) })
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			s.Observe("k" + strconv.Itoa(n))
+		}(i)
+	}
+	wg.Wait()
+
+	if got := losses.Load(); got != int64(s.Evictions()) {
+		t.Fatalf("callback fired %d times but %d evictions were counted", got, s.Evictions())
+	}
+	if s.Evictions() == 0 {
+		t.Fatal("32 keys into a set of 4 evicted nothing")
+	}
 }
