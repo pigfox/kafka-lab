@@ -85,9 +85,30 @@ func run(log *slog.Logger) error {
 	// A failure to read entropy stops the producer rather than falling back to
 	// a fixed value: a predictable nonce is a nonce that collides, and a
 	// consumer would then discard this run's opening messages as duplicates.
-	nonce, err := event.NewRunNonce()
-	if err != nil {
-		return err
+	//
+	// KL_RUN_NONCE OVERRIDES IT, AND ONLY AN EXPERIMENT SHOULD SET IT. Pinning
+	// the nonce makes the whole record stream reproducible: the generator is
+	// already seeded, so a fixed nonce plus a fixed KL_EVENT_SEED means two
+	// separate runs emit byte-identical keys. That is what lets a measured
+	// comparison feed BOTH arms the same records — and since the fault set is
+	// a pure function of the seed and the key, the same faults too. Without it
+	// the two arms have disjoint key spaces and are not comparable.
+	//
+	// It is unsafe in ordinary use for exactly the reason the random default
+	// exists: two runs sharing a nonce also share identities, so a consumer
+	// with dedupe on would discard the second run's messages as duplicates of
+	// the first. The experiment resets the broker between arms, which is what
+	// makes it safe there and nowhere else.
+	nonce := config.String("KL_RUN_NONCE", "")
+	if nonce == "" {
+		generated, err := event.NewRunNonce()
+		if err != nil {
+			return err
+		}
+		nonce = generated
+	} else {
+		log.Warn("KL_RUN_NONCE is set: record identities are REPRODUCIBLE and will collide with any other run sharing this nonce",
+			"nonce", nonce)
 	}
 	log.Info("producer run identity", "nonce", nonce, "header", event.DedupeHeader)
 

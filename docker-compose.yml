@@ -129,6 +129,17 @@ services:
       KL_METRICS_ADDR: ":2112"
       KL_EVENT_SEED: "${KL_EVENT_SEED:-1}"
       KL_EVENT_FILLER_BYTES: "${KL_EVENT_FILLER_BYTES:-0}"
+      # KL_RUN_NONCE pins the producer's per-run identity prefix so a measured
+      # comparison can feed both arms byte-identical record keys. The generator
+      # is already seeded, so a fixed nonce plus a fixed KL_EVENT_SEED makes two
+      # separate runs emit identical keys — and since the fault set is a pure
+      # function of the seed and the key, identical faults too.
+      #
+      # EMPTY IS THE DEFAULT AND IS WHAT ANY ORDINARY RUN WANTS. Two runs sharing
+      # a nonce also share identities, so a consumer with dedupe on would discard
+      # the second run's records as duplicates of the first. Only an experiment
+      # that resets the broker between runs should set it.
+      KL_RUN_NONCE: "${KL_RUN_NONCE:-}"
     restart: unless-stopped
 
   consumer:
