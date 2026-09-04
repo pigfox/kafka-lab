@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -566,4 +567,240 @@ func labelledCounter(t *testing.T, m *metrics.Set, name, store string) float64 {
 	}
 	t.Fatalf("counter %s{store=%q} not found", name, store)
 	return 0
+}
+
+// ── configuration ──────────────────────────────────────────────────────────
+//
+// run() dials twice and then blocks, so nothing downstream of it can be driven
+// in a test. The reads are the part with a decision in them, and a wrong
+// default here never reaches a broker to be noticed — the lab would simply run
+// the wrong experiment and report it confidently.
+
+func TestConsumerConfigDefaultsRunOnAnEmptyEnvironment(t *testing.T) {
+	for _, key := range []string{
+		"KAFKA_BROKERS", "KL_METRICS_ADDR", "KL_DIAL_RETRY",
+		"KL_DEDUPE", "KL_DEDUPE_CAPACITY", "KL_DEDUPE_TTL",
+		"KL_FAULT_RATE", "KL_FAULT_SEED",
+	} {
+		t.Setenv(key, "")
+	}
+
+	cfg := readConsumerConfig()
+
+	if len(cfg.Brokers) != 1 || cfg.Brokers[0] != "kafka:9092" {
+		t.Errorf("brokers %v want [kafka:9092]", cfg.Brokers)
+	}
+	if cfg.MetricsAddr != ":2112" {
+		t.Errorf("metrics addr %q want :2112", cfg.MetricsAddr)
+	}
+	if cfg.DialEvery != 2*time.Second {
+		t.Errorf("dial retry %v want 2s", cfg.DialEvery)
+	}
+
+	// THE TWO DEFAULTS THAT DECIDE WHAT THE LAB IS. Dedupe off is the honest
+	// arm — at-least-once is what the broker gives — and a fault rate of zero
+	// means the lab injects nothing until asked. Either one defaulting the
+	// other way would change every number the lab reports, silently.
+	if cfg.Dedupe {
+		t.Error("dedupe defaults ON; the default arm must be at-least-once")
+	}
+	if cfg.FaultRate != 0 {
+		t.Errorf("fault rate defaults to %v; the lab must inject nothing unless asked", cfg.FaultRate)
+	}
+
+	if cfg.DedupeCapacity != apply.DefaultCapacity {
+		t.Errorf("capacity %d want %d", cfg.DedupeCapacity, apply.DefaultCapacity)
+	}
+	if cfg.DedupeTTL != apply.DefaultTTL {
+		t.Errorf("ttl %v want %v", cfg.DedupeTTL, apply.DefaultTTL)
+	}
+	if cfg.FaultSeed != "kafka-lab" {
+		t.Errorf("fault seed %q want kafka-lab", cfg.FaultSeed)
+	}
+}
+
+func TestConsumerConfigReadsEveryKnob(t *testing.T) {
+	t.Setenv("KAFKA_BROKERS", "a:9092,b:9092")
+	t.Setenv("KL_METRICS_ADDR", ":9998")
+	t.Setenv("KL_DIAL_RETRY", "1500ms")
+	t.Setenv("KL_DEDUPE", "true")
+	t.Setenv("KL_DEDUPE_CAPACITY", "1234")
+	t.Setenv("KL_DEDUPE_TTL", "90s")
+	t.Setenv("KL_FAULT_RATE", "0.01")
+	t.Setenv("KL_FAULT_SEED", "pf-s314")
+
+	cfg := readConsumerConfig()
+
+	if len(cfg.Brokers) != 2 {
+		t.Errorf("brokers %v", cfg.Brokers)
+	}
+	if cfg.MetricsAddr != ":9998" {
+		t.Errorf("metrics addr %q", cfg.MetricsAddr)
+	}
+	if cfg.DialEvery != 1500*time.Millisecond {
+		t.Errorf("dial retry %v", cfg.DialEvery)
+	}
+	if !cfg.Dedupe {
+		t.Error("dedupe did not turn on")
+	}
+	if cfg.DedupeCapacity != 1234 {
+		t.Errorf("capacity %d", cfg.DedupeCapacity)
+	}
+	if cfg.DedupeTTL != 90*time.Second {
+		t.Errorf("ttl %v", cfg.DedupeTTL)
+	}
+	if cfg.FaultRate != 0.01 {
+		t.Errorf("fault rate %v", cfg.FaultRate)
+	}
+	if cfg.FaultSeed != "pf-s314" {
+		t.Errorf("fault seed %q", cfg.FaultSeed)
+	}
+}
+
+// An unparseable knob falls back rather than failing the process — but the two
+// that decide the experiment must fall back to OFF, not to on.
+func TestConsumerConfigFallsBackSafelyOnUnparseableKnobs(t *testing.T) {
+	t.Setenv("KL_DEDUPE", "yes-please")
+	t.Setenv("KL_FAULT_RATE", "one percent")
+	t.Setenv("KL_DEDUPE_CAPACITY", "lots")
+	t.Setenv("KL_DEDUPE_TTL", "a while")
+
+	cfg := readConsumerConfig()
+
+	if cfg.Dedupe {
+		t.Error("an unparseable KL_DEDUPE turned dedupe ON")
+	}
+	if cfg.FaultRate != 0 {
+		t.Errorf("an unparseable KL_FAULT_RATE gave rate %v; it must inject nothing", cfg.FaultRate)
+	}
+	if cfg.DedupeCapacity != apply.DefaultCapacity {
+		t.Errorf("capacity %d want the default", cfg.DedupeCapacity)
+	}
+	if cfg.DedupeTTL != apply.DefaultTTL {
+		t.Errorf("ttl %v want the default", cfg.DedupeTTL)
+	}
+}
+
+// ── construction ───────────────────────────────────────────────────────────
+
+func TestNewDeliveriesCarriesTheDedupeFlagThrough(t *testing.T) {
+	for _, dedupe := range []bool{false, true} {
+		m := metrics.New(metrics.RoleConsumer)
+		a := newDeliveries(quiet(), m, consumerConfig{
+			Dedupe:         dedupe,
+			DedupeCapacity: 64,
+			DedupeTTL:      time.Minute,
+		})
+		if a.Dedupe() != dedupe {
+			t.Fatalf("built with Dedupe=%v, applier reports %v", dedupe, a.Dedupe())
+		}
+	}
+}
+
+// THE TWO STORES ARE SEPARATE OBJECTS. `seen` decides suppression and is only
+// consulted when dedupe is on; `applied` is the per-key tally that makes a
+// repeat recognisable and runs on both arms. One store doing both jobs would
+// make the at-least-once arm report the duplicates it is supposed to expose.
+func TestNewDeliveriesBuildsTwoDistinctStores(t *testing.T) {
+	a := newDeliveries(quiet(), metrics.New(metrics.RoleConsumer), consumerConfig{
+		DedupeCapacity: 64,
+		DedupeTTL:      time.Minute,
+	})
+	if a.Seen() == a.AppliedKeys() {
+		t.Fatal("the seen-set and the apply tally are the same store")
+	}
+	if a.Seen() == nil || a.AppliedKeys() == nil {
+		t.Fatal("a store was nil")
+	}
+}
+
+// Each store's losses must reach its OWN label, or a reader cannot tell a store
+// that was too small from one that is working.
+func TestNewDeliveriesWiresEachStoreToItsOwnLossLabel(t *testing.T) {
+	m := metrics.New(metrics.RoleConsumer)
+	a := newDeliveries(quiet(), m, consumerConfig{
+		Dedupe:         true,
+		DedupeCapacity: 1, // so the second distinct key evicts the first
+		DedupeTTL:      time.Minute,
+	})
+
+	a.Apply(runner.Record{DedupeKey: "a"})
+	a.Apply(runner.Record{DedupeKey: "b"})
+
+	if got := labelledCounter(t, m, "kafka_lab_dedupe_evictions_total", "seen"); got == 0 {
+		t.Error("the seen-set's eviction did not reach the seen label")
+	}
+	if got := labelledCounter(t, m, "kafka_lab_dedupe_evictions_total", "applied"); got == 0 {
+		t.Error("the apply tally's eviction did not reach the applied label")
+	}
+}
+
+// The capacity and TTL must reach the stores, not sit unused in the config.
+func TestNewDeliveriesAppliesTheConfiguredCapacity(t *testing.T) {
+	a := newDeliveries(quiet(), metrics.New(metrics.RoleConsumer), consumerConfig{
+		DedupeCapacity: 2,
+		DedupeTTL:      time.Minute,
+	})
+
+	for _, k := range []string{"a", "b", "c", "d"} {
+		a.Apply(runner.Record{DedupeKey: k})
+	}
+	if got := a.AppliedKeys().Len(); got != 2 {
+		t.Fatalf("the apply tally holds %d keys; the configured capacity of 2 did not reach it", got)
+	}
+}
+
+func TestNewInjectorCarriesTheRateAndSeed(t *testing.T) {
+	i := newInjector(quiet(), consumerConfig{FaultRate: 0.25, FaultSeed: "pf-s314"})
+	if got := i.Rate(); got != 0.25 {
+		t.Fatalf("rate %v want 0.25", got)
+	}
+}
+
+// A rate of zero is the default and must fire nothing at all.
+func TestNewInjectorAtTheDefaultRateFiresNothing(t *testing.T) {
+	i := newInjector(quiet(), consumerConfig{FaultSeed: "kafka-lab"})
+	for n := 0; n < 500; n++ {
+		if i.Fault(runner.Record{DedupeKey: "run:" + strconv.Itoa(n)}) {
+			t.Fatal("the default injector faulted a record")
+		}
+	}
+	if i.Fired() != 0 {
+		t.Fatalf("fired %d keys at the default rate", i.Fired())
+	}
+}
+
+// THE INJECTOR LOGS EVERY KEY THAT FIRES, not the rewind targets. Targets picks
+// at most one record per partition per batch, so a log of targets is a subset
+// chosen by broker batching and cannot be compared across two runs.
+func TestNewInjectorLogsEveryFiredKey(t *testing.T) {
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	i := newInjector(log, consumerConfig{FaultRate: 1, FaultSeed: "pf-s314"})
+
+	// Three eligible keys in ONE partition of ONE batch: Targets can return
+	// only the earliest, but all three fire.
+	targets := i.Targets([]runner.Record{
+		{DedupeKey: "early", Topic: "events", Partition: 0, Offset: 10, LeaderEpoch: 4},
+		{DedupeKey: "middle", Topic: "events", Partition: 0, Offset: 11, LeaderEpoch: 4},
+		{DedupeKey: "late", Topic: "events", Partition: 0, Offset: 12, LeaderEpoch: 4},
+	})
+	if len(targets) != 1 {
+		t.Fatalf("got %d targets, want 1", len(targets))
+	}
+
+	out := buf.String()
+	if got := strings.Count(out, `msg="fault fired"`); got != 3 {
+		t.Fatalf("the log carries %d fault-fired lines, want 3:\n%s", got, out)
+	}
+	for _, key := range []string{"early", "middle", "late"} {
+		if !strings.Contains(out, "key="+key) {
+			t.Errorf("the log does not name the fired key %q:\n%s", key, out)
+		}
+	}
+	// The line must carry the whole address, so a fault can be traced to the
+	// record it belongs to.
+	if !strings.Contains(out, "partition=0") || !strings.Contains(out, "epoch=4") {
+		t.Errorf("a fault line is missing its partition or epoch:\n%s", out)
+	}
 }

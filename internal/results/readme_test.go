@@ -2,7 +2,10 @@ package results
 
 import (
 	"fmt"
+	"math"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -20,6 +23,10 @@ const (
 	onLog       = captureDir + "/arm-on-consumer.log"
 	offFaultSet = captureDir + "/arm-off-faultset.txt"
 	onFaultSet  = captureDir + "/arm-on-faultset.txt"
+
+	// resultsSummary is the run's write-up. It is the only record of the
+	// SIZING run, which produced no capture of its own.
+	resultsSummary = "../../results/pf-s313/results.md"
 )
 
 func consumerSeries(name string) string {
@@ -137,6 +144,129 @@ func TestEveryPublishedFigureMatchesTheCommittedCapture(t *testing.T) {
 		t.Errorf("the measured table has %d rows but %d are checked; an unchecked row can drift freely",
 			len(rows), len(want))
 	}
+}
+
+// ── THE LEDE'S FIGURES ARE BOUND TOO ───────────────────────────────────────
+//
+// THE TABLE GUARD ABOVE CANNOT SEE PROSE, and the section's most consequential
+// claim now lives in prose: the tail multiplier, promoted above the table
+// because "size for the fault rate" is the mistake a reader is most likely to
+// make. A figure quoted in a lede and derived nowhere is exactly the drift this
+// package exists to prevent — worse than a wrong table cell, because a reader
+// takes a lede on trust.
+//
+// Both figures are DERIVED, neither is typed:
+//
+//   - 35× comes from the committed capture — double applies over keys fired.
+//   - 4.5× comes from results.md's own record of the sizing run, which produced
+//     no capture of its own. It is extracted from that file rather than
+//     transcribed, so the README and the results write-up cannot disagree about
+//     what the sizing run did.
+func TestTheLedeFiguresAreDerivedFromTheEvidence(t *testing.T) {
+	doc := readme(t)
+	// FLATTENED FIRST. This is prose, so it is hard-wrapped, and a phrase the
+	// guard looks for lands across a newline as often as not. Searching the raw
+	// bytes would make the guard fail on rewrapping and pass on a deletion that
+	// happened to leave the words on one line — noise in one direction and a
+	// hole in the other.
+	lede := flatten(ledeSection(t, doc))
+
+	off := scrape(t, offMetrics)
+	doubles := metric(t, off, consumerSeries("double_applied_total"))
+	fired := lines(t, offLog, `msg="fault fired"`)
+	if fired == 0 {
+		t.Fatal("the capture records no fired keys; the multiplier is undefined")
+	}
+
+	graded := fmt.Sprintf("**%d duplicate applications per fault**",
+		int(math.Round(float64(doubles)/float64(fired))))
+	if !strings.Contains(lede, graded) {
+		t.Errorf("the lede does not carry %q, derived from %d double applies over %d fired keys:\n%s",
+			graded, doubles, fired, lede)
+	}
+
+	sizingFaults, sizingDuplicates := sizingRun(t)
+	sizing := fmt.Sprintf("**%s×**", trimFloat(float64(sizingDuplicates)/float64(sizingFaults)))
+	if !strings.Contains(lede, sizing) {
+		t.Errorf("the lede does not carry %q, derived from the sizing run's %d faults and %d duplicates:\n%s",
+			sizing, sizingFaults, sizingDuplicates, lede)
+	}
+
+	// The claim the figures exist to support. Without it the two numbers are
+	// trivia; with it they are a sizing rule.
+	for _, phrase := range []string{
+		"wrong by more than an order of magnitude",
+		"broker batch composition",
+	} {
+		if !strings.Contains(lede, phrase) {
+			t.Errorf("the lede no longer states %q:\n%s", phrase, lede)
+		}
+	}
+}
+
+// THE OLD PLACEMENTS MUST STAY GONE. The finding used to be split — a bare
+// order-of-magnitude claim above the table with no figure, and the 35× figure
+// below it. Restating either would put the claim in two places, which is how
+// two copies of a number start disagreeing.
+func TestTheTailMultiplierIsStatedInExactlyOnePlace(t *testing.T) {
+	doc := flatten(readme(t))
+	if got := strings.Count(doc, "order of magnitude"); got != 1 {
+		t.Errorf("the order-of-magnitude claim appears %d times; it belongs in the lede alone", got)
+	}
+	if got := strings.Count(doc, "duplicate applications per fault"); got != 1 {
+		t.Errorf("the per-fault multiplier appears %d times; it belongs in the lede alone", got)
+	}
+}
+
+// ledeSection returns the tail-multiplier section: from its heading to the next
+// one. Bounding it matters — a figure found anywhere in a 380-line README is
+// not evidence that the lede carries it.
+func ledeSection(t *testing.T, doc string) string {
+	t.Helper()
+	const heading = "### A rewind redelivers a tail"
+	start := strings.Index(doc, heading)
+	if start < 0 {
+		t.Fatalf("the README carries no %q section", heading)
+	}
+	rest := doc[start+len(heading):]
+	if end := strings.Index(rest, "\n### "); end >= 0 {
+		rest = rest[:end]
+	}
+	if strings.TrimSpace(rest) == "" {
+		t.Fatal("the lede section is empty; this guard would pass vacuously")
+	}
+	return rest
+}
+
+// sizingRun reads the sizing run's faults and duplicates out of results.md.
+//
+// THAT RUN PRODUCED NO CAPTURE — it was the dry run that sized the graded one —
+// so results.md is the only record of it, and this reads that record rather
+// than letting the README carry a second copy of the numbers.
+func sizingRun(t *testing.T) (faults, duplicates int) {
+	t.Helper()
+	raw, err := os.ReadFile(resultsSummary)
+	if err != nil {
+		t.Fatalf("the results summary is unreadable: %v", err)
+	}
+	m := sizingPattern.FindStringSubmatch(string(raw))
+	if m == nil {
+		t.Fatalf("%s no longer records the sizing run in the expected form", resultsSummary)
+	}
+	return atoi(t, m[1]), atoi(t, m[2])
+}
+
+var sizingPattern = regexp.MustCompile(`(\d+) faults producing (\d+)\s+duplicates`)
+
+// flatten collapses every run of whitespace to one space, so a hard-wrapped
+// sentence reads as one line.
+func flatten(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// trimFloat renders a ratio the way the prose does: no trailing zeros.
+func trimFloat(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 type publishedRow struct{ off, on string }

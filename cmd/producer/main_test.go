@@ -324,3 +324,178 @@ func counterValue(t *testing.T, m *metrics.Set, name string) float64 {
 	t.Fatalf("counter %s not found", name)
 	return 0
 }
+
+// ── configuration ──────────────────────────────────────────────────────────
+//
+// A WRONG DEFAULT NEVER REACHES A BROKER TO BE NOTICED. run() dials and then
+// blocks, so nothing downstream of it can be driven in a test; the reads are
+// the part with a decision in them, and they are checked here.
+
+func TestProducerConfigDefaultsRunOnAnEmptyEnvironment(t *testing.T) {
+	for _, key := range []string{
+		"KAFKA_BROKERS", "KL_METRICS_ADDR", "KL_DIAL_RETRY",
+		"KL_EVENT_SEED", "KL_EVENT_FILLER_BYTES", "KL_RUN_NONCE",
+	} {
+		t.Setenv(key, "")
+	}
+
+	cfg := readProducerConfig()
+
+	if len(cfg.Brokers) != 1 || cfg.Brokers[0] != "kafka:9092" {
+		t.Errorf("brokers %v want [kafka:9092]", cfg.Brokers)
+	}
+	if cfg.MetricsAddr != ":2112" {
+		t.Errorf("metrics addr %q want :2112", cfg.MetricsAddr)
+	}
+	if cfg.DialEvery != 2*time.Second {
+		t.Errorf("dial retry %v want 2s", cfg.DialEvery)
+	}
+	if cfg.Seed != 1 {
+		t.Errorf("seed %d want 1", cfg.Seed)
+	}
+	if cfg.Filler != 0 {
+		t.Errorf("filler %d want 0", cfg.Filler)
+	}
+	// THE NONCE DEFAULT IS EMPTY, NOT A VALUE. Empty means "generate one", and
+	// a literal default here would be a fixed nonce shared by every run — the
+	// exact hazard KL_RUN_NONCE's warning is about.
+	if cfg.Nonce != "" {
+		t.Errorf("nonce %q; the default must be empty so a fresh one is generated", cfg.Nonce)
+	}
+}
+
+func TestProducerConfigReadsEveryKnob(t *testing.T) {
+	t.Setenv("KAFKA_BROKERS", "a:9092, b:9092 ,")
+	t.Setenv("KL_METRICS_ADDR", ":9999")
+	t.Setenv("KL_DIAL_RETRY", "750ms")
+	t.Setenv("KL_EVENT_SEED", "77")
+	t.Setenv("KL_EVENT_FILLER_BYTES", "128")
+	t.Setenv("KL_RUN_NONCE", "pf-s314-fixed")
+
+	cfg := readProducerConfig()
+
+	if len(cfg.Brokers) != 2 || cfg.Brokers[0] != "a:9092" || cfg.Brokers[1] != "b:9092" {
+		t.Errorf("brokers %v; the list must split, trim and drop empties", cfg.Brokers)
+	}
+	if cfg.MetricsAddr != ":9999" {
+		t.Errorf("metrics addr %q", cfg.MetricsAddr)
+	}
+	if cfg.DialEvery != 750*time.Millisecond {
+		t.Errorf("dial retry %v", cfg.DialEvery)
+	}
+	if cfg.Seed != 77 {
+		t.Errorf("seed %d", cfg.Seed)
+	}
+	if cfg.Filler != 128 {
+		t.Errorf("filler %d", cfg.Filler)
+	}
+	if cfg.Nonce != "pf-s314-fixed" {
+		t.Errorf("nonce %q", cfg.Nonce)
+	}
+}
+
+// An unparseable knob falls back to its default rather than failing the
+// process: a demo that refuses to boot over a typo in an optional value is
+// worse than one that logs the default it used.
+func TestProducerConfigFallsBackOnAnUnparseableKnob(t *testing.T) {
+	t.Setenv("KL_DIAL_RETRY", "not-a-duration")
+	t.Setenv("KL_EVENT_SEED", "twelve")
+
+	cfg := readProducerConfig()
+
+	if cfg.DialEvery != 2*time.Second {
+		t.Errorf("dial retry %v want the 2s default", cfg.DialEvery)
+	}
+	if cfg.Seed != 1 {
+		t.Errorf("seed %d want the default 1", cfg.Seed)
+	}
+}
+
+// ── the run nonce ──────────────────────────────────────────────────────────
+
+func TestResolveNonceGeneratesOneWhenUnset(t *testing.T) {
+	got, err := resolveNonce(quiet(), "", func() (string, error) { return "generated-nonce", nil })
+	if err != nil {
+		t.Fatalf("resolveNonce: %v", err)
+	}
+	if got != "generated-nonce" {
+		t.Fatalf("got %q want the generated value", got)
+	}
+}
+
+func TestResolveNoncePrefersTheConfiguredValue(t *testing.T) {
+	got, err := resolveNonce(quiet(), "pinned", func() (string, error) {
+		t.Fatal("the generator ran even though KL_RUN_NONCE was set")
+		return "", nil
+	})
+	if err != nil {
+		t.Fatalf("resolveNonce: %v", err)
+	}
+	if got != "pinned" {
+		t.Fatalf("got %q want pinned", got)
+	}
+}
+
+// A PINNED NONCE MUST WARN. It is the only signal in the logs that this run's
+// record identities will collide with any other run sharing the nonce, which is
+// exactly what makes it unsafe outside a reset-between-arms experiment.
+func TestResolveNonceWarnsWhenTheNonceIsPinned(t *testing.T) {
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	if _, err := resolveNonce(log, "pf-s314-fixed", nil); err != nil {
+		t.Fatalf("resolveNonce: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "REPRODUCIBLE") {
+		t.Fatalf("a pinned nonce logged no warning:\n%s", out)
+	}
+	if !strings.Contains(out, "pf-s314-fixed") {
+		t.Fatalf("the warning does not name the nonce:\n%s", out)
+	}
+}
+
+// And the generated path must NOT warn, or the warning stops meaning anything.
+func TestResolveNonceIsQuietWhenItGeneratesOne(t *testing.T) {
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	if _, err := resolveNonce(log, "", func() (string, error) { return "fresh", nil }); err != nil {
+		t.Fatalf("resolveNonce: %v", err)
+	}
+	if out := buf.String(); out != "" {
+		t.Fatalf("a generated nonce warned:\n%s", out)
+	}
+}
+
+// A FAILURE TO READ ENTROPY STOPS THE PRODUCER. Falling back to a fixed value
+// would be a nonce that collides, and a consumer with dedupe on would then
+// discard this run's opening messages as duplicates of the last run's.
+func TestResolveNonceSurfacesAnEntropyFailure(t *testing.T) {
+	wantErr := errors.New("no entropy")
+	got, err := resolveNonce(quiet(), "", func() (string, error) { return "", wantErr })
+	if err == nil {
+		t.Fatal("a failing entropy source produced a nonce instead of an error")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("the generator's error was not returned: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("got the nonce %q alongside the error", got)
+	}
+}
+
+// The real generator is what run() passes, so the wiring is checked too.
+func TestResolveNonceWithTheRealGeneratorProducesAUsableNonce(t *testing.T) {
+	got, err := resolveNonce(quiet(), "", event.NewRunNonce)
+	if err != nil {
+		t.Fatalf("resolveNonce: %v", err)
+	}
+	if len(got) != 16 {
+		t.Fatalf("nonce %q has %d characters, want 16", got, len(got))
+	}
+	if strings.Contains(got, ":") {
+		t.Fatalf("nonce %q contains the id separator", got)
+	}
+}

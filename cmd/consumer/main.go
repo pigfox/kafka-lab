@@ -46,33 +46,97 @@ func isShutdown(err error) bool {
 	return err == context.Canceled || err == context.DeadlineExceeded
 }
 
-func run(log *slog.Logger) error {
-	ctx, stop := runner.SignalContext()
-	defer stop()
-
-	brokers := config.Brokers("KAFKA_BROKERS", "kafka:9092")
-	metricsAddr := config.String("KL_METRICS_ADDR", ":2112")
-	dialEvery := config.Duration("KL_DIAL_RETRY", 2*time.Second)
+// consumerConfig is everything this binary reads from the environment.
+//
+// IT IS A STRUCT AND A FUNCTION SO IT CAN BE TESTED, the same move the
+// committer and offsetSeeker interfaces below already make: name the part that
+// has a decision in it, so the part that needs a broker stops standing in front
+// of it. run() is still untestable — it dials twice and blocks — but a wrong
+// default is a defect that never reaches a broker to be noticed.
+type consumerConfig struct {
+	Brokers     []string
+	MetricsAddr string
+	DialEvery   time.Duration
 
 	// DEDUPE IS OFF BY DEFAULT, and that is the honest default rather than a
 	// cautious one: at-least-once is what the broker gives, so a lab whose
 	// default arm hid the duplicates would be teaching the wrong lesson. Both
-	// arms are reachable by exporting this one variable, with no code change.
-	dedupe := config.Bool("KL_DEDUPE", false)
-	dedupeCapacity := config.Int("KL_DEDUPE_CAPACITY", apply.DefaultCapacity)
-	dedupeTTL := config.Duration("KL_DEDUPE_TTL", apply.DefaultTTL)
+	// arms are reachable by exporting one variable, with no code change.
+	Dedupe         bool
+	DedupeCapacity int
+	DedupeTTL      time.Duration
+
+	// FAULT INJECTION IS OFF BY DEFAULT (rate 0). The rate is the fraction of
+	// distinct keys whose commit is replaced by a cursor rewind — see
+	// internal/fault, which explains why skipping the commit alone produces no
+	// duplicate at all. The seed makes the fault set a pure function of the
+	// record keys, so both arms of an experiment are fed the same faults.
+	FaultRate float64
+	FaultSeed string
+}
+
+// readConsumerConfig reads the environment. Every default is a literal, so a
+// bare clone runs with an empty environment.
+func readConsumerConfig() consumerConfig {
+	return consumerConfig{
+		Brokers:        config.Brokers("KAFKA_BROKERS", "kafka:9092"),
+		MetricsAddr:    config.String("KL_METRICS_ADDR", ":2112"),
+		DialEvery:      config.Duration("KL_DIAL_RETRY", 2*time.Second),
+		Dedupe:         config.Bool("KL_DEDUPE", false),
+		DedupeCapacity: config.Int("KL_DEDUPE_CAPACITY", apply.DefaultCapacity),
+		DedupeTTL:      config.Duration("KL_DEDUPE_TTL", apply.DefaultTTL),
+		FaultRate:      config.Float("KL_FAULT_RATE", 0),
+		FaultSeed:      config.String("KL_FAULT_SEED", "kafka-lab"),
+	}
+}
+
+// newDeliveries builds the delivery-semantics applier and its two bounded
+// stores, each wired to report what it forgets.
+//
+// NO EFFECT IS ATTACHED. This lab has no business side effect to run, and
+// inventing one would put a fabricated workload inside a measurement about
+// delivery. applied_total IS the record of the effect running; a real consumer
+// would pass its own function here.
+func newDeliveries(log *slog.Logger, m *metrics.Set, cfg consumerConfig) *apply.Applier {
+	return apply.New(apply.Options{
+		Dedupe:      cfg.Dedupe,
+		Seen:        idem.New(cfg.DedupeCapacity, cfg.DedupeTTL, nil, lossOf(log, m, metrics.StoreSeen)),
+		AppliedKeys: idem.New(cfg.DedupeCapacity, cfg.DedupeTTL, nil, lossOf(log, m, metrics.StoreApplied)),
+		Observer:    observer{m: m, log: log},
+	})
+}
+
+// newInjector builds the fault injector, logging every key that fires.
+//
+// IT LOGS FIRED KEYS, NOT REWIND TARGETS, and the distinction cost a graded run
+// to learn: Targets returns at most one record per partition per batch, so the
+// target set is a subset of the fired set chosen by broker batching. The fired
+// set is a pure function of the seed and the delivered keys, so it is the one
+// that reproduces — and the one a comparison between two arms can be made over.
+func newInjector(log *slog.Logger, cfg consumerConfig) *fault.Injector {
+	return fault.New(cfg.FaultRate, cfg.FaultSeed, func(r runner.Record) {
+		log.Info("fault fired", "key", r.DedupeKey, "partition", r.Partition,
+			"offset", r.Offset, "epoch", r.LeaderEpoch)
+	})
+}
+
+func run(log *slog.Logger) error {
+	ctx, stop := runner.SignalContext()
+	defer stop()
+
+	cfg := readConsumerConfig()
 
 	m := metrics.New(metrics.RoleConsumer)
-	serveMetrics(ctx, log, metricsAddr, m)
+	serveMetrics(ctx, log, cfg.MetricsAddr, m)
 
-	log.Info("waiting for the broker", "brokers", brokers)
-	consumerCl, err := kafkabus.DialRetry(ctx, log, brokers, dialEvery, kafkabus.ConsumerOpts()...)
+	log.Info("waiting for the broker", "brokers", cfg.Brokers)
+	consumerCl, err := kafkabus.DialRetry(ctx, log, cfg.Brokers, cfg.DialEvery, kafkabus.ConsumerOpts()...)
 	if err != nil {
 		return err
 	}
 	defer consumerCl.Close()
 
-	controlCl, err := kafkabus.DialRetry(ctx, log, brokers, dialEvery, kafkabus.ControlConsumerOpts()...)
+	controlCl, err := kafkabus.DialRetry(ctx, log, cfg.Brokers, cfg.DialEvery, kafkabus.ControlConsumerOpts()...)
 	if err != nil {
 		return err
 	}
@@ -85,33 +149,13 @@ func run(log *slog.Logger) error {
 	m.RateLimit.Set(defaults.ConsumerRatePerSec)
 	m.WorkMillis.Set(float64(defaults.ConsumerWorkMillis))
 
-	deliveries := apply.New(apply.Options{
-		Dedupe:      dedupe,
-		Seen:        idem.New(dedupeCapacity, dedupeTTL, nil, lossOf(log, m, metrics.StoreSeen)),
-		AppliedKeys: idem.New(dedupeCapacity, dedupeTTL, nil, lossOf(log, m, metrics.StoreApplied)),
-		Observer:    observer{m: m, log: log},
-		// NO EFFECT IS ATTACHED. This lab has no business side effect to run,
-		// and inventing one would put a fabricated workload inside a
-		// measurement about delivery. applied_total IS the record of the
-		// effect running; a real consumer would pass its own function here.
-	})
-
-	// FAULT INJECTION IS OFF BY DEFAULT. The rate is the fraction of distinct
-	// keys whose commit is replaced by a cursor rewind — see internal/fault,
-	// which explains why skipping the commit alone produces no duplicate at
-	// all. The seed makes the fault set a pure function of the record keys, so
-	// both arms of an experiment are fed the same faults.
-	faultRate := config.Float("KL_FAULT_RATE", 0)
-	faultSeed := config.String("KL_FAULT_SEED", "kafka-lab")
-	injector := fault.New(faultRate, faultSeed, func(r runner.Record) {
-		log.Info("fault fired", "key", r.DedupeKey, "partition", r.Partition,
-			"offset", r.Offset, "epoch", r.LeaderEpoch)
-	})
+	deliveries := newDeliveries(log, m, cfg)
+	injector := newInjector(log, cfg)
 
 	log.Info("delivery semantics configured",
-		"dedupe", dedupe, "capacity", dedupeCapacity, "ttl", dedupeTTL,
+		"dedupe", cfg.Dedupe, "capacity", cfg.DedupeCapacity, "ttl", cfg.DedupeTTL,
 		"header", event.DedupeHeader,
-		"fault_rate", faultRate, "fault_seed", faultSeed)
+		"fault_rate", cfg.FaultRate, "fault_seed", cfg.FaultSeed)
 
 	watcher := kafkabus.NewWatcher(controlCl, log, func() { m.ControlApplied.Inc() })
 

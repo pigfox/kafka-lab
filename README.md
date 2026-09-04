@@ -301,18 +301,22 @@ answers:
 - a **restart**, where the in-memory store starts empty,
 - a **second consumer instance**, which has its own store and shares nothing.
 
-### A rewind redelivers a tail — this is a finding, not noise
+### A rewind redelivers a tail — size for that, not for the fault rate
 
-A cursor is per *partition*. Rewinding to one record replays that record **and
-every later record of that partition the loop had already polled**. So duplicates
-substantially exceed injected faults, and the multiplier is whatever the broker
-happened to put in that batch.
+Sizing on **"1% of commits lost ≈ 1% duplicates" is wrong by more than an order
+of magnitude.** On the graded run below, 56 injected faults produced 1948
+double applies — **35 duplicate applications per fault**. On a shorter sizing
+run beforehand the same injector gave **4.5×**.
+
+It is a range rather than a constant because **the multiplier is broker batch
+composition.** A cursor is per *partition*: rewinding to one record replays that
+record **and every later record of that partition the loop had already polled**.
+As lag builds the consumer polls larger batches, so each rewind replays more —
+which is the whole distance between those two figures. Nothing about the
+injector changed between them.
 
 That is not an artefact of the harness. It is what a crash does: the process
-does not lose one message, it loses everything applied since the last commit. Any
-sizing done on "we inject 1% of records, so we expect about 1% duplicates" is
-wrong by more than an order of magnitude, and the measurement below is the
-evidence.
+does not lose one message, it loses everything applied since the last commit.
 
 ### Measured
 
@@ -334,9 +338,8 @@ digests — are committed under `results/pf-s313/capture/`.
 | store evictions | 0 | 0 |
 | store expiries | 0 | 0 |
 
-**The at-least-once arm applied 1948 records a second time.** Its 56 faults
-produced those 1948 duplicates — roughly 35 duplicate applications per injected
-fault, which is the tail effect above, not a rate.
+**The at-least-once arm applied 1948 records a second time**, from 56 injected
+faults — the tail effect described above.
 
 **The idempotent arm applied nothing twice.** It saw *more* redeliveries — 2126,
 because it ran slightly longer — and suppressed every one of them.
